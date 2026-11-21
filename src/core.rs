@@ -198,6 +198,51 @@ impl<B: VoiceBackend> VoiceBackend for Arc<B> {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UnavailableVoiceBackend;
+
+impl VoiceBackend for UnavailableVoiceBackend {
+    async fn resolve_track(
+        &self,
+        _url: &YouTubeUrl,
+        _cancel: CancellationToken,
+    ) -> Result<TrackMetadata, VoiceBackendError> {
+        Err(VoiceBackendError::ResolveFailed(
+            "voice backend is not configured".to_string(),
+        ))
+    }
+
+    async fn join(
+        &self,
+        _target: VoiceTarget,
+        _cancel: CancellationToken,
+    ) -> Result<(), VoiceBackendError> {
+        Err(VoiceBackendError::JoinFailed(
+            "voice backend is not configured".to_string(),
+        ))
+    }
+
+    async fn play(
+        &self,
+        _target: VoiceTarget,
+        _track: &TrackMetadata,
+        _generation: PlaybackGeneration,
+        _cancel: CancellationToken,
+    ) -> Result<(), VoiceBackendError> {
+        Err(VoiceBackendError::PlaybackFailed(
+            "voice backend is not configured".to_string(),
+        ))
+    }
+
+    async fn stop(&self, _guild_id: GuildId) -> Result<(), VoiceBackendError> {
+        Ok(())
+    }
+
+    async fn leave(&self, _guild_id: GuildId) -> Result<(), VoiceBackendError> {
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct CoreState {
     discord_state: DiscordConnectionState,
@@ -1382,5 +1427,31 @@ mod tests {
 
         let events = backend.events();
         assert!(events.contains(&BackendEvent::Stop(guild_id)));
+    }
+
+    #[tokio::test]
+    async fn unavailable_voice_backend_rejects_play_and_allows_reversible_stop_and_leave() {
+        let core = AppCore::new(super::UnavailableVoiceBackend);
+
+        let play_error = core
+            .play(PlayRequest::new(
+                guild(1),
+                channel(2),
+                "https://youtu.be/dQw4w9WgXcQ",
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            play_error,
+            CoreError::Backend(VoiceBackendError::ResolveFailed(_))
+        ));
+        assert_eq!(core.status().playback_state, PlaybackState::Idle);
+        assert_eq!(core.status().active_track, None);
+
+        let after_stop = core.stop().await.unwrap();
+        assert_eq!(after_stop.playback_state, PlaybackState::Idle);
+
+        let after_leave = core.leave().await.unwrap();
+        assert_eq!(after_leave.voice_target, None);
     }
 }

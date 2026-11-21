@@ -93,7 +93,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-To verify your local `.env` and external audio binaries (`yt-dlp` and `ffmpeg`):
+To start Zebot locally (runs `.env` and external tool preflight checks, connects to Discord, registers `/status` in `DISCORD_GUILD_ID`, and shuts down cleanly on `Ctrl+C`):
 
 ```powershell
 cargo run
