@@ -1,0 +1,20 @@
+[package]
+name = "zebot"
+version = "0.1.0"
+edition = "2024"
+license-file = "LICENSE"
+build = "build.rs"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"

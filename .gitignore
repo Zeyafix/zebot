@@ -1,0 +1,8 @@
+/target
+/.env
+/.env.*
+!/.env.example
+/temp/*
+!/temp/.gitkeep
+.DS_Store
+Thumbs.db
