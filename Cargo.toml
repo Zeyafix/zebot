@@ -6,10 +6,8 @@ license-file = "LICENSE"
 build = "build.rs"
 
 [dependencies]
-tokio = { version = "1", default-features = false, features = ["sync"] }
-
-[dev-dependencies]
-tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+serenity = { version = "0.12", default-features = false, features = ["builder", "client", "gateway", "http", "model", "rustls_backend"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -1,9 +1,13 @@
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use zebot::config::Config;
+use zebot::core::{AppCore, UnavailableVoiceBackend};
 use zebot::dependencies::check_external_tools;
+use zebot::discord::run_discord_bot;
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let config = match Config::load() {
         Ok(config) => config,
         Err(error) => {
@@ -27,5 +31,27 @@ fn main() -> ExitCode {
     println!("  yt-dlp: {}", tools.yt_dlp);
     println!("  ffmpeg: {}", tools.ffmpeg);
 
-    ExitCode::SUCCESS
+    let app_core = Arc::new(AppCore::new(UnavailableVoiceBackend));
+    let shutdown_signal = async {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                println!("shutdown signal received (Ctrl+C); disconnecting from Discord...");
+            }
+            Err(error) => {
+                eprintln!("warning: failed to listen for Ctrl+C signal: {error}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    match run_discord_bot(&config, app_core, shutdown_signal).await {
+        Ok(()) => {
+            println!("zebot shut down cleanly");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
