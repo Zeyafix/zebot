@@ -2,9 +2,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use zebot::config::Config;
-use zebot::core::{AppCore, UnavailableVoiceBackend};
+use zebot::core::{AppCore, VoiceLifecycleListener};
 use zebot::dependencies::check_external_tools;
 use zebot::discord::run_discord_bot;
+use zebot::voice::SongbirdVoiceBackend;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -31,7 +32,15 @@ async fn main() -> ExitCode {
     println!("  yt-dlp: {}", tools.yt_dlp);
     println!("  ffmpeg: {}", tools.ffmpeg);
 
-    let app_core = Arc::new(AppCore::new(UnavailableVoiceBackend));
+    let voice_backend =
+        SongbirdVoiceBackend::new(config.yt_dlp_path.clone(), config.ffmpeg_path.clone());
+    let songbird = voice_backend.songbird();
+    let app_core = Arc::new(AppCore::new(voice_backend));
+    let lifecycle_listener: Arc<dyn VoiceLifecycleListener> = app_core.clone();
+    app_core
+        .backend()
+        .attach_listener(Arc::downgrade(&lifecycle_listener));
+
     let shutdown_signal = async {
         match tokio::signal::ctrl_c().await {
             Ok(()) => {
@@ -44,7 +53,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    match run_discord_bot(&config, app_core, shutdown_signal).await {
+    match run_discord_bot(&config, app_core, songbird, shutdown_signal).await {
         Ok(()) => {
             println!("zebot shut down cleanly");
             ExitCode::SUCCESS
