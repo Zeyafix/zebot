@@ -364,7 +364,7 @@ fn help_and_invalid_arguments_return_expected_exit_codes() {
 }
 
 #[test]
-fn interactive_mode_starts_when_stopped_and_can_keep_or_stop_when_running() {
+fn interactive_mode_holds_console_and_stops_on_enter_and_prompts_when_already_running() {
     let fixture = LauncherFixture::create("interactive").expect("create fixture");
     fixture.write_dotenv().expect("write .env");
     let compile = fixture
@@ -372,7 +372,68 @@ fn interactive_mode_starts_when_stopped_and_can_keep_or_stop_when_running() {
         .expect("compile fake zebot");
     assert!(compile.status.success());
 
-    let run_interactive = |stdin_text: &str| -> Output {
+    let mut session = Command::new("cmd.exe")
+        .arg("/d")
+        .arg("/c")
+        .arg(&fixture.launch_bat)
+        .current_dir(&fixture.caller_dir)
+        .env_remove("DISCORD_TOKEN")
+        .env("SPAWN_CHILD", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn interactive launch.bat");
+
+    let child_pid = wait_for_file_u32(&fixture.child_pid_file, Duration::from_secs(10))
+        .expect("timed out waiting for interactive child pid");
+    assert!(is_pid_alive(child_pid).expect("check interactive child alive"));
+    assert_eq!(
+        fixture
+            .run_launcher(&["status"], &fixture.caller_dir)
+            .expect("status while interactive console is open")
+            .status
+            .code(),
+        Some(0)
+    );
+
+    if let Some(mut stdin) = session.stdin.take() {
+        stdin
+            .write_all(b"\r\n")
+            .expect("send Enter to interactive session");
+    }
+    let session_output = session
+        .wait_with_output()
+        .expect("wait for interactive session to stop on Enter");
+    let session_stdout = String::from_utf8_lossy(&session_output.stdout);
+    assert_eq!(
+        session_output.status.code(),
+        Some(0),
+        "interactive session failed: stdout={session_stdout}, stderr={}",
+        String::from_utf8_lossy(&session_output.stderr)
+    );
+    assert!(session_stdout.contains("Press Enter or close this window to stop Zebot."));
+    assert!(session_stdout.contains("Zebot stopped (PID "));
+    assert!(!fixture.pid_file.exists());
+    assert!(
+        !is_pid_alive(child_pid).expect("check child stopped after Enter"),
+        "child process must not survive pressing Enter in interactive console"
+    );
+    assert_eq!(
+        fixture
+            .run_launcher(&["status"], &fixture.caller_dir)
+            .expect("status after interactive Enter stop")
+            .status
+            .code(),
+        Some(3)
+    );
+
+    let bg_start = fixture
+        .run_launcher(&["start"], &fixture.caller_dir)
+        .expect("start background zebot");
+    assert_eq!(bg_start.status.code(), Some(0));
+
+    let run_interactive_prompt = |stdin_text: &str| -> Output {
         let mut child = Command::new("cmd.exe")
             .arg("/d")
             .arg("/c")
@@ -383,33 +444,16 @@ fn interactive_mode_starts_when_stopped_and_can_keep_or_stop_when_running() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn interactive launch.bat");
+            .expect("spawn interactive prompt launch.bat");
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(stdin_text.as_bytes());
         }
         child
             .wait_with_output()
-            .expect("wait interactive launch.bat")
+            .expect("wait interactive prompt launch.bat")
     };
 
-    let started = run_interactive("\r\n");
-    assert_eq!(
-        started.status.code(),
-        Some(0),
-        "interactive start failed: {}",
-        String::from_utf8_lossy(&started.stdout)
-    );
-    assert!(String::from_utf8_lossy(&started.stdout).contains("Zebot started (PID "));
-    assert_eq!(
-        fixture
-            .run_launcher(&["status"], &fixture.caller_dir)
-            .expect("status after interactive start")
-            .status
-            .code(),
-        Some(0)
-    );
-
-    let kept = run_interactive("n\r\n\r\n");
+    let kept = run_interactive_prompt("n\r\n\r\n");
     assert_eq!(kept.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&kept.stdout).contains("Keeping Zebot running."));
     assert_eq!(
@@ -421,13 +465,13 @@ fn interactive_mode_starts_when_stopped_and_can_keep_or_stop_when_running() {
         Some(0)
     );
 
-    let stopped = run_interactive("y\r\n\r\n");
+    let stopped = run_interactive_prompt("\r\n\r\n");
     assert_eq!(stopped.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&stopped.stdout).contains("Zebot stopped (PID "));
     assert_eq!(
         fixture
             .run_launcher(&["status"], &fixture.caller_dir)
-            .expect("status after interactive stop")
+            .expect("status after interactive prompt stop")
             .status
             .code(),
         Some(3)

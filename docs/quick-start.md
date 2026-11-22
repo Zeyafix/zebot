@@ -90,8 +90,8 @@ Use `launch.bat` in the repository root to manage Zebot without keeping a manual
 
 Double-click `launch.bat` (or run it with no arguments):
 
-- When Zebot is **stopped**, `launch.bat` builds the binary if needed, starts Zebot in the background, and waits for a keypress so you can read the startup output or any errors.
-- When Zebot is **running**, `launch.bat` shows its PID and prompts whether to stop it (`Y/n`, default `Y`).
+- When Zebot is **stopped**, `launch.bat` builds the binary if needed, starts Zebot, streams its live output in the console window, and keeps the window open. Press `Enter` or close the console window (`X`) to stop Zebot and its child processes cleanly. If startup fails, the window stays open until you press `Enter` so you can read the error.
+- When Zebot is **already running** (for example, started in the background via `launch.bat start`), `launch.bat` shows its PID and prompts whether to stop it (`Y/n`, default `Y`).
 
 ### Non-Interactive CLI Usage (Terminal and AI Agents)
 

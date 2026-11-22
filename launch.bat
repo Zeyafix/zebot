@@ -53,10 +53,16 @@ goto :interactive_pause
 
 :interactive_start
 echo.
-echo Starting Zebot...
-call :cmd_start
+call :prepare_start
+set "PREP_CODE=%ERRORLEVEL%"
+if not "%PREP_CODE%"=="0" (
+    set "EXIT_CODE=%PREP_CODE%"
+    goto :interactive_pause
+)
+call :invoke_ps run-interactive
 set "EXIT_CODE=%ERRORLEVEL%"
-goto :interactive_pause
+if not "%EXIT_CODE%"=="0" goto :interactive_pause
+exit /b 0
 
 :interactive_prompt_stop
 echo.
@@ -75,8 +81,8 @@ goto :interactive_pause
 
 :interactive_pause
 echo.
-echo Press any key to close this window...
-pause >nul
+echo Press Enter to close this window...
+set /p "_ZEBOT_CLOSE="
 exit /b %EXIT_CODE%
 
 :cmd_start
@@ -85,6 +91,13 @@ set "CHECK_CODE=%ERRORLEVEL%"
 if "%CHECK_CODE%"=="0" exit /b 0
 if not "%CHECK_CODE%"=="3" exit /b %CHECK_CODE%
 
+call :prepare_start
+if errorlevel 1 exit /b %ERRORLEVEL%
+
+call :invoke_ps start
+exit /b %ERRORLEVEL%
+
+:prepare_start
 if not exist "%REPO_ROOT%\.env" goto :check_env_fallback
 goto :maybe_build
 
@@ -129,9 +142,7 @@ if not exist "%REPO_ROOT%\target\debug\zebot.exe" (
     echo Error: Zebot binary was not found at "%REPO_ROOT%\target\debug\zebot.exe".
     exit /b 1
 )
-
-call :invoke_ps start
-exit /b %ERRORLEVEL%
+exit /b 0
 
 :cmd_stop
 call :invoke_ps stop
@@ -146,7 +157,7 @@ exit /b %ERRORLEVEL%
 echo Usage: launch.bat [start ^| stop ^| status ^| help]
 echo.
 echo Commands:
-echo   ^(no arguments^)  Interactive mode: start Zebot when stopped, or prompt to stop when running.
+echo   ^(no arguments^)  Interactive mode: run Zebot in this console ^(Enter or close window stops it^), or prompt to stop if already running.
 echo   start           Build ^(when Cargo.toml and cargo are present^) and start Zebot in the background.
 echo   stop            Stop Zebot and any child audio processes ^(yt-dlp, ffmpeg^) cleanly.
 echo   status          Show whether Zebot is running or stopped.
@@ -647,6 +658,46 @@ function Invoke-TaskKill {
     }
 }
 
+function Stop-ProcessTreeList {
+    param([object[]]$Targets)
+    $rootPids = @($Targets | ForEach-Object { [int]$_.Pid })
+    $descendants = @(Get-DescendantProcessInfo -RootPids $rootPids)
+    $allTracked = @($Targets) + @($descendants)
+
+    foreach ($target in $Targets) {
+        $gracefulExit = Invoke-TaskKill -Arguments @('/PID', [string]$target.Pid, '/T')
+        if ($gracefulExit -eq 0) {
+            $null = Wait-TrackedProcessesExit -Tracked @($target) -TimeoutMs 5000
+        }
+        if (Test-TrackedProcessAlive -ProcessId $target.Pid -ExpectedTicks $target.Ticks) {
+            $null = Invoke-TaskKill -Arguments @('/PID', [string]$target.Pid, '/T', '/F')
+        }
+    }
+
+    foreach ($desc in $descendants) {
+        if (Test-TrackedProcessAlive -ProcessId $desc.Pid -ExpectedTicks $desc.Ticks) {
+            $null = Invoke-TaskKill -Arguments @('/PID', [string]$desc.Pid, '/T', '/F')
+        }
+    }
+
+    $allGone = Wait-TrackedProcessesExit -Tracked $allTracked -TimeoutMs 3000
+    $survivors = @()
+    if (-not $allGone) {
+        $survivors = @($allTracked | Where-Object {
+            Test-TrackedProcessAlive -ProcessId $_.Pid -ExpectedTicks $_.Ticks
+        })
+    }
+
+    $userChildCount = @($descendants | Where-Object {
+        -not $_.Name.Equals('conhost.exe', [System.StringComparison]::OrdinalIgnoreCase)
+    }).Count
+
+    return [pscustomobject]@{
+        Survivors = $survivors
+        UserChildCount = $userChildCount
+    }
+}
+
 function Invoke-Stop {
     $state = Get-SyncedLauncherState
     if (-not $state.Running) {
@@ -664,49 +715,196 @@ function Invoke-Stop {
             Ticks = Get-ProcessCreationTicks $_
         }
     })
-    $rootPids = @($targets | ForEach-Object { $_.Pid })
-    $descendants = @(Get-DescendantProcessInfo -RootPids $rootPids)
-    $allTracked = @($targets) + @($descendants)
 
-    foreach ($target in $targets) {
-        $gracefulExit = Invoke-TaskKill -Arguments @('/PID', [string]$target.Pid, '/T')
-        if ($gracefulExit -eq 0) {
-            $null = Wait-TrackedProcessesExit -Tracked @($target) -TimeoutMs 5000
-        }
-        if (Test-TrackedProcessAlive -ProcessId $target.Pid -ExpectedTicks $target.Ticks) {
-            $null = Invoke-TaskKill -Arguments @('/PID', [string]$target.Pid, '/T', '/F')
-        }
-    }
-
-    foreach ($desc in $descendants) {
-        if (Test-TrackedProcessAlive -ProcessId $desc.Pid -ExpectedTicks $desc.Ticks) {
-            $null = Invoke-TaskKill -Arguments @('/PID', [string]$desc.Pid, '/T', '/F')
-        }
-    }
-
-    $allGone = Wait-TrackedProcessesExit -Tracked $allTracked -TimeoutMs 3000
-    if (-not $allGone) {
-        $survivors = @($allTracked | Where-Object {
-            Test-TrackedProcessAlive -ProcessId $_.Pid -ExpectedTicks $_.Ticks
-        })
-        if ($survivors.Count -gt 0) {
-            $remPids = ($survivors | ForEach-Object { $_.Pid }) -join ', '
-            Write-Output "Error: failed to stop process(es): $remPids."
-            exit 1
-        }
+    $result = Stop-ProcessTreeList -Targets $targets
+    if ($result.Survivors.Count -gt 0) {
+        $remPids = ($result.Survivors | ForEach-Object { $_.Pid }) -join ', '
+        Write-Output "Error: failed to stop process(es): $remPids."
+        exit 1
     }
 
     Remove-PidState
     $stoppedPids = ($targets | ForEach-Object { $_.Pid }) -join ', '
     Write-Output "Zebot stopped (PID $stoppedPids)."
-
-    $userChildCount = @($descendants | Where-Object {
-        -not $_.Name.Equals('conhost.exe', [System.StringComparison]::OrdinalIgnoreCase)
-    }).Count
-    if ($userChildCount -gt 0) {
-        Write-Output "Terminated $userChildCount child process(es)."
+    if ($result.UserChildCount -gt 0) {
+        Write-Output "Terminated $($result.UserChildCount) child process(es)."
     }
     exit 0
+}
+
+function Invoke-InteractiveRun {
+    $state = Get-SyncedLauncherState
+    if ($state.Running) {
+        $pids = ($state.Processes | ForEach-Object { [int]$_.ProcessId }) -join ', '
+        Write-Output "Zebot is already running (PID $pids)."
+        exit 0
+    }
+
+    [System.IO.Directory]::CreateDirectory($launcherDir) | Out-Null
+    Remove-Item -LiteralPath $stdoutLog -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $stderrLog -Force -ErrorAction SilentlyContinue
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $stdoutStream = $null
+    $stderrStream = $null
+    $stdoutWriter = $null
+    $stderrWriter = $null
+    $proc = $null
+    $trackedTicks = [long]0
+    $stopRequested = $false
+
+    try {
+        $stdoutStream = [System.IO.File]::Open($stdoutLog, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+        $stderrStream = [System.IO.File]::Open($stderrLog, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+        $stdoutWriter = New-Object System.IO.StreamWriter($stdoutStream, $utf8NoBom)
+        $stderrWriter = New-Object System.IO.StreamWriter($stderrStream, $utf8NoBom)
+        $stdoutWriter.AutoFlush = $true
+        $stderrWriter.AutoFlush = $true
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $exePath
+        $psi.WorkingDirectory = $repoRoot
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $cim = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue
+        $trackedTicks = Get-ProcessCreationTicks $cim
+        Write-PidState -ProcessId $proc.Id -StartTimeUtcTicks $trackedTicks
+
+        Write-Output "Starting Zebot (PID $($proc.Id))..."
+        Write-Output 'Press Enter or close this window to stop Zebot.'
+        Write-Output '(To run in the background, use: launch.bat start)'
+        Write-Output ''
+
+        $stdoutTask = $proc.StandardOutput.ReadLineAsync()
+        $stderrTask = $proc.StandardError.ReadLineAsync()
+
+        $inputRedirected = [Console]::IsInputRedirected
+        $stdinTask = $null
+        if ($inputRedirected) {
+            $stdinTask = [Console]::In.ReadLineAsync()
+        } else {
+            while ([Console]::KeyAvailable) {
+                $null = [Console]::ReadKey($true)
+            }
+        }
+
+        while (-not $proc.HasExited) {
+            while ($null -ne $stdoutTask -and $stdoutTask.IsCompleted) {
+                $line = $stdoutTask.GetAwaiter().GetResult()
+                if ($null -eq $line) {
+                    $stdoutTask = $null
+                } else {
+                    $stdoutWriter.WriteLine($line)
+                    Write-Output $line
+                    $stdoutTask = $proc.StandardOutput.ReadLineAsync()
+                }
+            }
+
+            while ($null -ne $stderrTask -and $stderrTask.IsCompleted) {
+                $errLine = $stderrTask.GetAwaiter().GetResult()
+                if ($null -eq $errLine) {
+                    $stderrTask = $null
+                } else {
+                    $stderrWriter.WriteLine($errLine)
+                    Write-Output $errLine
+                    $stderrTask = $proc.StandardError.ReadLineAsync()
+                }
+            }
+
+            if ($inputRedirected) {
+                if ($null -ne $stdinTask -and $stdinTask.IsCompleted) {
+                    $stopRequested = $true
+                    break
+                }
+            } else {
+                while ([Console]::KeyAvailable) {
+                    $key = [Console]::ReadKey($true)
+                    if ($key.Key -eq [ConsoleKey]::Enter) {
+                        $stopRequested = $true
+                        break
+                    }
+                }
+                if ($stopRequested) {
+                    break
+                }
+            }
+
+            Start-Sleep -Milliseconds 100
+        }
+
+        if ($stopRequested) {
+            Write-Output ''
+            Write-Output "Stopping Zebot (PID $($proc.Id))..."
+            $target = [pscustomobject]@{
+                Pid = [int]$proc.Id
+                Name = 'zebot.exe'
+                Ticks = $trackedTicks
+            }
+            $stopResult = Stop-ProcessTreeList -Targets @($target)
+            Remove-PidState
+            if ($stopResult.Survivors.Count -gt 0) {
+                $remPids = ($stopResult.Survivors | ForEach-Object { $_.Pid }) -join ', '
+                Write-Output "Error: failed to stop process(es): $remPids."
+                exit 1
+            }
+            Write-Output "Zebot stopped (PID $($proc.Id))."
+            exit 0
+        }
+
+        $null = $proc.WaitForExit(1000)
+        while ($null -ne $stdoutTask -and $stdoutTask.Wait(200)) {
+            $line = $stdoutTask.GetAwaiter().GetResult()
+            if ($null -eq $line) { break }
+            $stdoutWriter.WriteLine($line)
+            Write-Output $line
+            $stdoutTask = $proc.StandardOutput.ReadLineAsync()
+        }
+        while ($null -ne $stderrTask -and $stderrTask.Wait(200)) {
+            $errLine = $stderrTask.GetAwaiter().GetResult()
+            if ($null -eq $errLine) { break }
+            $stderrWriter.WriteLine($errLine)
+            Write-Output $errLine
+            $stderrTask = $proc.StandardError.ReadLineAsync()
+        }
+
+        $exitCode = [int]$proc.ExitCode
+        Remove-PidState
+        if ($exitCode -ne 0) {
+            Write-Output ''
+            Write-Output "Error: Zebot exited with code $exitCode."
+            Write-Output 'See temp\launcher\zebot.stderr.log and docs\quick-start.md for details.'
+            exit 1
+        }
+        Write-Output ''
+        Write-Output 'Zebot stopped.'
+        exit 0
+    } finally {
+        if ($null -ne $proc) {
+            try {
+                if (-not $proc.HasExited) {
+                    $target = [pscustomobject]@{
+                        Pid = [int]$proc.Id
+                        Name = 'zebot.exe'
+                        Ticks = $trackedTicks
+                    }
+                    $null = Stop-ProcessTreeList -Targets @($target)
+                }
+            } catch {
+            }
+            Remove-PidState
+            try { $proc.Dispose() } catch {}
+        }
+        if ($null -ne $stdoutWriter) { try { $stdoutWriter.Dispose() } catch {} }
+        elseif ($null -ne $stdoutStream) { try { $stdoutStream.Dispose() } catch {} }
+        if ($null -ne $stderrWriter) { try { $stderrWriter.Dispose() } catch {} }
+        elseif ($null -ne $stderrStream) { try { $stderrStream.Dispose() } catch {} }
+    }
 }
 
 switch ($action) {
@@ -714,6 +912,7 @@ switch ($action) {
     'check-running' { Invoke-CheckRunning }
     'start' { Invoke-Start }
     'stop' { Invoke-Stop }
+    'run-interactive' { Invoke-InteractiveRun }
     default {
         Write-Output "Error: unknown internal action '$action'."
         exit 1
