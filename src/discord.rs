@@ -11,24 +11,30 @@ use serenity::builder::{
     CreateCommand, CreateCommandOption, CreateInteractionResponse,
     CreateInteractionResponseMessage, EditInteractionResponse,
 };
+use serenity::cache::Cache;
 use serenity::client::{Client, Context, EventHandler};
 use serenity::gateway::{ConnectionStage, ShardStageUpdateEvent};
+use serenity::http::Http;
 use serenity::model::application::{
     CommandInteraction, CommandOptionType, Interaction, ResolvedValue,
 };
+use serenity::model::channel::ChannelType;
 use serenity::model::event::ResumedEvent;
 use serenity::model::gateway::{GatewayIntents, Ready};
 use serenity::model::guild::Guild;
-use serenity::model::id::{ChannelId as SerenityChannelId, GuildId as SerenityGuildId};
+use serenity::model::id::{
+    ChannelId as SerenityChannelId, GuildId as SerenityGuildId, UserId as SerenityUserId,
+};
 use serenity::model::permissions::Permissions;
 use serenity::model::voice::VoiceState;
 use songbird::{SerenityInit, Songbird};
 
+use crate::api::{VoiceDirectory, VoiceDirectoryError};
 use crate::config::Config;
 use crate::core::{AppCore, CoreError, VoiceBackend};
 use crate::state::{
-    BotStatus, DiscordConnectionState, GuildId, PlayRequest, PlaybackState, TrackMetadata,
-    VoiceChannelId, VoiceTarget,
+    BotStatus, DiscordConnectionState, GuildId, PlayRequest, PlaybackState, TrackMetadata, UserId,
+    VoiceChannelId, VoiceChannelInfo, VoiceChannelKind, VoiceMemberInfo, VoiceTarget,
 };
 use crate::youtube::YouTubeUrl;
 
@@ -947,6 +953,272 @@ impl<B: VoiceBackend + 'static> EventHandler for DiscordHandler<B> {
     }
 }
 
+pub struct SerenityVoiceDirectory {
+    scope: CommandScope,
+    cache: Arc<Cache>,
+    http: Arc<Http>,
+    known_bots: Arc<Mutex<HashMap<u64, bool>>>,
+}
+
+impl SerenityVoiceDirectory {
+    fn lock_known_bots(&self) -> MutexGuard<'_, HashMap<u64, bool>> {
+        self.known_bots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+fn map_voice_channel_kind(kind: ChannelType) -> Option<VoiceChannelKind> {
+    match kind {
+        ChannelType::Voice => Some(VoiceChannelKind::Voice),
+        ChannelType::Stage => Some(VoiceChannelKind::Stage),
+        _ => None,
+    }
+}
+
+impl VoiceDirectory for SerenityVoiceDirectory {
+    fn guild_id(&self) -> GuildId {
+        GuildId::from_non_zero(self.scope.guild_id)
+    }
+
+    async fn list_voice_channels(&self) -> Result<Vec<VoiceChannelInfo>, VoiceDirectoryError> {
+        let guild_id = self.scope.guild_id();
+        let known_bots = self.lock_known_bots();
+
+        let Some(guild) = self.cache.guild(guild_id) else {
+            return Err(VoiceDirectoryError::GuildUnavailable);
+        };
+
+        let mut ranked_channels: Vec<(u16, u64, VoiceChannelInfo)> = guild
+            .channels
+            .values()
+            .filter_map(|channel| {
+                let kind = map_voice_channel_kind(channel.kind)?;
+                let channel_id = VoiceChannelId::new(channel.id.get())?;
+
+                let mut members: Vec<VoiceMemberInfo> = guild
+                    .voice_states
+                    .values()
+                    .filter(|state| state.channel_id == Some(channel.id))
+                    .filter_map(|state| {
+                        let raw_user_id = state.user_id.get();
+                        let user_id = UserId::new(raw_user_id)?;
+                        let member = state
+                            .member
+                            .as_ref()
+                            .or_else(|| guild.members.get(&state.user_id));
+                        let cached_user = self.cache.user(state.user_id);
+
+                        let username = member
+                            .map(|entry| entry.user.name.clone())
+                            .or_else(|| cached_user.as_ref().map(|user| user.name.clone()));
+
+                        let display_name = member
+                            .and_then(|entry| {
+                                entry
+                                    .nick
+                                    .clone()
+                                    .or_else(|| entry.user.global_name.clone())
+                            })
+                            .or_else(|| {
+                                cached_user
+                                    .as_ref()
+                                    .and_then(|user| user.global_name.clone())
+                            });
+
+                        let is_bot = member
+                            .map(|entry| entry.user.bot)
+                            .or_else(|| cached_user.as_ref().map(|user| user.bot))
+                            .or_else(|| known_bots.get(&raw_user_id).copied())
+                            .unwrap_or(false);
+
+                        Some(VoiceMemberInfo {
+                            user_id,
+                            username,
+                            display_name,
+                            is_bot,
+                        })
+                    })
+                    .collect();
+
+                members.sort_by_key(|member| member.user_id);
+
+                Some((
+                    channel.position,
+                    channel.id.get(),
+                    VoiceChannelInfo {
+                        id: channel_id,
+                        name: channel.name.clone(),
+                        kind,
+                        members,
+                    },
+                ))
+            })
+            .collect();
+
+        ranked_channels.sort_by_key(|(position, raw_id, _)| (*position, *raw_id));
+
+        Ok(ranked_channels
+            .into_iter()
+            .map(|(_, _, info)| info)
+            .collect())
+    }
+
+    async fn resolve_user_voice_channel(
+        &self,
+        user_id: UserId,
+    ) -> Result<VoiceChannelId, VoiceDirectoryError> {
+        let guild_id = self.scope.guild_id();
+        let Some(guild) = self.cache.guild(guild_id) else {
+            return Err(VoiceDirectoryError::GuildUnavailable);
+        };
+
+        let serenity_user_id = SerenityUserId::new(user_id.get());
+        let Some(channel_id) = guild
+            .voice_states
+            .get(&serenity_user_id)
+            .and_then(|state| state.channel_id)
+        else {
+            return Err(VoiceDirectoryError::UserNotInVoiceChannel(user_id));
+        };
+
+        VoiceChannelId::new(channel_id.get())
+            .ok_or(VoiceDirectoryError::UserNotInVoiceChannel(user_id))
+    }
+
+    async fn validate_voice_channel(
+        &self,
+        channel_id: VoiceChannelId,
+    ) -> Result<(), VoiceDirectoryError> {
+        let guild_id = self.scope.guild_id();
+        let target_channel_id = SerenityChannelId::new(channel_id.get());
+        let bot_user_id = self.cache.current_user().id;
+
+        let cached_permissions = {
+            let Some(guild) = self.cache.guild(guild_id) else {
+                return Err(VoiceDirectoryError::GuildUnavailable);
+            };
+
+            let Some(channel) = guild.channels.get(&target_channel_id) else {
+                return Err(VoiceDirectoryError::VoiceChannelNotFound(channel_id));
+            };
+
+            if map_voice_channel_kind(channel.kind).is_none() {
+                return Err(VoiceDirectoryError::VoiceChannelNotFound(channel_id));
+            }
+
+            if bot_user_id.get() == 0 {
+                None
+            } else {
+                guild
+                    .members
+                    .get(&bot_user_id)
+                    .map(|bot_member| guild.user_permissions_in(channel, bot_member))
+            }
+        };
+
+        let permissions = match cached_permissions {
+            Some(permissions) => Some(permissions),
+            None if bot_user_id.get() != 0 => {
+                match guild_id.member(&self.http, bot_user_id).await {
+                    Ok(bot_member) => self.cache.guild(guild_id).and_then(|guild| {
+                        let channel = guild.channels.get(&target_channel_id)?;
+                        Some(guild.user_permissions_in(channel, &bot_member))
+                    }),
+                    Err(_) => None,
+                }
+            }
+            None => None,
+        };
+
+        if let Some(permissions) = permissions
+            && let Err(missing) = check_voice_permissions(permissions)
+        {
+            return Err(VoiceDirectoryError::MissingVoicePermissions {
+                channel_id,
+                missing: missing.describe(),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+pub struct PreparedDiscordBot<B> {
+    app_core: Arc<AppCore<B>>,
+    shutting_down: Arc<AtomicBool>,
+    client: Client,
+    voice_directory: Arc<SerenityVoiceDirectory>,
+}
+
+impl<B: VoiceBackend + 'static> PreparedDiscordBot<B> {
+    pub fn voice_directory(&self) -> Arc<SerenityVoiceDirectory> {
+        Arc::clone(&self.voice_directory)
+    }
+
+    pub async fn run<S>(mut self, shutdown_signal: S) -> Result<(), DiscordError>
+    where
+        S: Future<Output = ()> + Send + 'static,
+    {
+        let shard_manager = Arc::clone(&self.client.shard_manager);
+
+        run_with_shutdown(
+            self.app_core,
+            self.shutting_down,
+            async move {
+                self.client
+                    .start()
+                    .await
+                    .map_err(|error| DiscordError::ClientRun(Box::new(error)))
+            },
+            shutdown_signal,
+            move || async move {
+                shard_manager.shutdown_all().await;
+            },
+        )
+        .await
+    }
+}
+
+pub async fn prepare_discord_bot<B>(
+    config: &Config,
+    app_core: Arc<AppCore<B>>,
+    songbird: Arc<Songbird>,
+) -> Result<PreparedDiscordBot<B>, DiscordError>
+where
+    B: VoiceBackend + 'static,
+{
+    let scope = CommandScope::from_config(config)?;
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let known_bots = Arc::new(Mutex::new(HashMap::new()));
+    let handler = DiscordHandler {
+        scope,
+        app_core: Arc::clone(&app_core),
+        shutting_down: Arc::clone(&shutting_down),
+        known_bots: Arc::clone(&known_bots),
+    };
+
+    let client = Client::builder(&config.discord_token, required_gateway_intents())
+        .event_handler(handler)
+        .register_songbird_with(songbird)
+        .await
+        .map_err(|error| DiscordError::ClientBuild(Box::new(error)))?;
+
+    let voice_directory = Arc::new(SerenityVoiceDirectory {
+        scope,
+        cache: Arc::clone(&client.cache),
+        http: Arc::clone(&client.http),
+        known_bots,
+    });
+
+    Ok(PreparedDiscordBot {
+        app_core,
+        shutting_down,
+        client,
+        voice_directory,
+    })
+}
+
 pub async fn run_discord_bot<B, S>(
     config: &Config,
     app_core: Arc<AppCore<B>>,
@@ -957,38 +1229,8 @@ where
     B: VoiceBackend + 'static,
     S: Future<Output = ()> + Send + 'static,
 {
-    let scope = CommandScope::from_config(config)?;
-    let shutting_down = Arc::new(AtomicBool::new(false));
-    let handler = DiscordHandler {
-        scope,
-        app_core: Arc::clone(&app_core),
-        shutting_down: Arc::clone(&shutting_down),
-        known_bots: Arc::new(Mutex::new(HashMap::new())),
-    };
-
-    let mut client = Client::builder(&config.discord_token, required_gateway_intents())
-        .event_handler(handler)
-        .register_songbird_with(songbird)
-        .await
-        .map_err(|error| DiscordError::ClientBuild(Box::new(error)))?;
-
-    let shard_manager = Arc::clone(&client.shard_manager);
-
-    run_with_shutdown(
-        app_core,
-        shutting_down,
-        async move {
-            client
-                .start()
-                .await
-                .map_err(|error| DiscordError::ClientRun(Box::new(error)))
-        },
-        shutdown_signal,
-        move || async move {
-            shard_manager.shutdown_all().await;
-        },
-    )
-    .await
+    let prepared = prepare_discord_bot(config, app_core, songbird).await?;
+    prepared.run(shutdown_signal).await
 }
 
 async fn run_with_shutdown<B, S, RunFut, ShutdownFut, ShutdownFn>(
@@ -1153,6 +1395,50 @@ mod tests {
         .register_songbird_with(songbird)
         .await;
         assert!(client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn prepared_discord_bot_voice_directory_reports_guild_unavailable_before_ready() {
+        let config = crate::config::Config {
+            discord_token: "test-token-not-used-for-network".to_string(),
+            discord_guild_id: 111_222_333_444_555_666,
+            allowed_channel_id: 999_888_777_666_555_444,
+            api_token: "test-api-token".to_string(),
+            api_port: 8080,
+            yt_dlp_path: "yt-dlp".to_string(),
+            ffmpeg_path: "ffmpeg".to_string(),
+        };
+        let app_core = Arc::new(AppCore::new(UnavailableVoiceBackend));
+        let songbird = Songbird::serenity_from_config(build_songbird_config());
+        let prepared = super::prepare_discord_bot(&config, app_core, songbird)
+            .await
+            .expect("prepare discord bot");
+        let directory = prepared.voice_directory();
+
+        assert_eq!(
+            crate::api::VoiceDirectory::guild_id(directory.as_ref()),
+            GuildId::new(111_222_333_444_555_666).unwrap()
+        );
+        assert_eq!(
+            crate::api::VoiceDirectory::list_voice_channels(directory.as_ref()).await,
+            Err(crate::api::VoiceDirectoryError::GuildUnavailable)
+        );
+        assert_eq!(
+            crate::api::VoiceDirectory::resolve_user_voice_channel(
+                directory.as_ref(),
+                crate::state::UserId::new(123).unwrap()
+            )
+            .await,
+            Err(crate::api::VoiceDirectoryError::GuildUnavailable)
+        );
+        assert_eq!(
+            crate::api::VoiceDirectory::validate_voice_channel(
+                directory.as_ref(),
+                VoiceChannelId::new(456).unwrap()
+            )
+            .await,
+            Err(crate::api::VoiceDirectoryError::GuildUnavailable)
+        );
     }
 
     #[test]

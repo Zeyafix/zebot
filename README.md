@@ -4,7 +4,8 @@ A locally hosted, AI-friendly Discord bot written in Rust that streams YouTube a
 
 ## Getting Started
 
-See [Quick Start for Devs](docs/quick-start.md) to install prerequisites, configure a Discord application, and run local verification checks.
+- See [Quick Start for Devs](docs/quick-start.md) to install prerequisites, configure a Discord application, and run local verification checks.
+- See [Local HTTP/JSON API](docs/local-api.md) for the secured `127.0.0.1` JSON API used by both hosts and AI agents.
 
 ## Project Principles
 

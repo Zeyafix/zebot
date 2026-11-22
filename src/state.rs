@@ -1,13 +1,18 @@
 use std::fmt;
+use std::num::NonZeroU64;
 
 use crate::youtube::YouTubeUrl;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GuildId(u64);
 
 impl GuildId {
     pub fn new(raw: u64) -> Option<Self> {
         if raw == 0 { None } else { Some(Self(raw)) }
+    }
+
+    pub fn from_non_zero(value: NonZeroU64) -> Self {
+        Self(value.get())
     }
 
     pub fn get(self) -> u64 {
@@ -21,12 +26,16 @@ impl fmt::Display for GuildId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct VoiceChannelId(u64);
 
 impl VoiceChannelId {
     pub fn new(raw: u64) -> Option<Self> {
         if raw == 0 { None } else { Some(Self(raw)) }
+    }
+
+    pub fn from_non_zero(value: NonZeroU64) -> Self {
+        Self(value.get())
     }
 
     pub fn get(self) -> u64 {
@@ -38,6 +47,51 @@ impl fmt::Display for VoiceChannelId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct UserId(u64);
+
+impl UserId {
+    pub fn new(raw: u64) -> Option<Self> {
+        if raw == 0 { None } else { Some(Self(raw)) }
+    }
+
+    pub fn from_non_zero(value: NonZeroU64) -> Self {
+        Self(value.get())
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for UserId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VoiceChannelKind {
+    Voice,
+    Stage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceMemberInfo {
+    pub user_id: UserId,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+    pub is_bot: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceChannelInfo {
+    pub id: VoiceChannelId,
+    pub name: String,
+    pub kind: VoiceChannelKind,
+    pub members: Vec<VoiceMemberInfo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -139,8 +193,8 @@ impl PlayRequest {
 #[cfg(test)]
 mod tests {
     use super::{
-        BotStatus, DiscordConnectionState, GuildId, PlaybackState, TrackMetadata, VoiceChannelId,
-        VoiceTarget,
+        BotStatus, DiscordConnectionState, GuildId, PlaybackState, TrackMetadata, UserId,
+        VoiceChannelId, VoiceTarget,
     };
     use crate::youtube::YouTubeUrl;
 
@@ -148,14 +202,18 @@ mod tests {
     fn rejects_zero_snowflakes_and_accepts_positive_ids() {
         assert_eq!(GuildId::new(0), None);
         assert_eq!(VoiceChannelId::new(0), None);
+        assert_eq!(UserId::new(0), None);
 
         let guild_id = GuildId::new(100).unwrap();
         let channel_id = VoiceChannelId::new(200).unwrap();
+        let user_id = UserId::new(300).unwrap();
 
         assert_eq!(guild_id.get(), 100);
         assert_eq!(channel_id.get(), 200);
+        assert_eq!(user_id.get(), 300);
         assert_eq!(guild_id.to_string(), "100");
         assert_eq!(channel_id.to_string(), "200");
+        assert_eq!(user_id.to_string(), "300");
     }
 
     #[test]

@@ -2,10 +2,11 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use zebot::api::{ApiConfig, BoundApiServer};
 use zebot::config::Config;
-use zebot::core::{AppCore, VoiceLifecycleListener};
+use zebot::core::{AppCore, CancellationToken, VoiceLifecycleListener};
 use zebot::dependencies::check_external_tools;
-use zebot::discord::run_discord_bot;
+use zebot::discord::prepare_discord_bot;
 use zebot::voice::SongbirdVoiceBackend;
 
 fn write_stdout_line(message: &str) {
@@ -154,14 +155,82 @@ async fn main() -> ExitCode {
         .backend()
         .attach_listener(Arc::downgrade(&lifecycle_listener));
 
-    match run_discord_bot(&config, app_core, songbird, wait_for_shutdown_signal()).await {
-        Ok(()) => {
-            write_stdout_line("zebot shut down cleanly");
-            ExitCode::SUCCESS
-        }
+    let discord_bot = match prepare_discord_bot(&config, Arc::clone(&app_core), songbird).await {
+        Ok(bot) => bot,
         Err(error) => {
             write_stderr_line(&format!("error: {error}"));
-            ExitCode::FAILURE
+            return ExitCode::FAILURE;
         }
+    };
+
+    let voice_directory = discord_bot.voice_directory();
+    let api_server = match BoundApiServer::bind(
+        ApiConfig::from_config(&config),
+        Arc::clone(&app_core),
+        voice_directory,
+    )
+    .await
+    {
+        Ok(server) => server,
+        Err(error) => {
+            write_stderr_line(&format!("error: {error}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    write_stdout_line(&format!(
+        "local HTTP API listening on http://{}",
+        api_server.local_addr()
+    ));
+
+    let shutdown = CancellationToken::new();
+    let signal_shutdown = shutdown.clone();
+    let signal_task = tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        signal_shutdown.cancel();
+    });
+
+    let api_shutdown = shutdown.clone();
+    let api_cancel_on_exit = shutdown.clone();
+    let api_future = async move {
+        let result = api_server
+            .serve(async move {
+                api_shutdown.cancelled().await;
+            })
+            .await;
+        api_cancel_on_exit.cancel();
+        result
+    };
+
+    let discord_shutdown = shutdown.clone();
+    let discord_cancel_on_exit = shutdown.clone();
+    let discord_future = async move {
+        let result = discord_bot
+            .run(async move {
+                discord_shutdown.cancelled().await;
+            })
+            .await;
+        discord_cancel_on_exit.cancel();
+        result
+    };
+
+    let (discord_result, api_result) = tokio::join!(discord_future, api_future);
+    signal_task.abort();
+
+    let mut had_error = false;
+    if let Err(error) = discord_result {
+        write_stderr_line(&format!("error: {error}"));
+        had_error = true;
+    }
+    if let Err(error) = api_result {
+        write_stderr_line(&format!("error: {error}"));
+        had_error = true;
+    }
+
+    if had_error {
+        ExitCode::FAILURE
+    } else {
+        write_stdout_line("zebot shut down cleanly");
+        ExitCode::SUCCESS
     }
 }
