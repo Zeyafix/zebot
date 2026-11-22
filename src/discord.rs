@@ -880,8 +880,41 @@ impl<B: VoiceBackend + 'static> EventHandler for DiscordHandler<B> {
 
                 let request =
                     PlayRequest::new(core_guild_id, voice_channel_id, validated_url.as_str());
-                let reply =
-                    format_play_outcome(self.app_core.play(request).await, voice_channel_id);
+                let play_result = self.app_core.play(request).await;
+                let reply = match play_result {
+                    Ok(status) => {
+                        let bot_user_id = ctx.cache.current_user().id.get();
+                        let became_empty = status.voice_target.is_some_and(|target| {
+                            self.collect_voice_channel_members(
+                                &ctx,
+                                self.scope.guild_id(),
+                                target.channel_id,
+                            )
+                            .is_some_and(|members| {
+                                should_auto_leave_voice_channel(
+                                    &status,
+                                    core_guild_id,
+                                    &members,
+                                    bot_user_id,
+                                )
+                            })
+                        });
+
+                        if became_empty {
+                            if let Err(error) = self.app_core.leave().await {
+                                eprintln!(
+                                    "warning: failed to leave voice channel that emptied during play: {error}"
+                                );
+                            }
+                            CommandReply::public(format!(
+                                "Everyone left <#{voice_channel_id}> while loading the track, so Zebot disconnected."
+                            ))
+                        } else {
+                            format_play_outcome(Ok(status), voice_channel_id)
+                        }
+                    }
+                    Err(error) => format_play_outcome(Err(error), voice_channel_id),
+                };
                 edit_deferred_reply(&ctx, &command, reply).await;
             }
             STOP_COMMAND_NAME => {

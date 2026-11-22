@@ -953,11 +953,24 @@ mod tests {
         );
         let input = Input::from(adapter);
 
-        let playable = input
+        let mut playable = input
             .make_playable_async(get_codec_registry(), get_probe())
             .await
             .expect("RawAdapter PCM stream should be playable");
         assert!(playable.is_playable());
+
+        let parsed = playable
+            .parsed_mut()
+            .expect("playable input should expose parsed format and decoder");
+        let packet = parsed
+            .format
+            .next_packet()
+            .expect("RawReader should yield a 20ms PCM packet");
+        let decoded = parsed
+            .decoder
+            .decode(&packet)
+            .expect("Symphonia PCM decoder should decode RawReader packet");
+        assert_eq!(decoded.frames(), DISCORD_SAMPLE_RATE as usize / 50);
     }
 
     #[cfg(windows)]
