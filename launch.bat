@@ -658,6 +658,45 @@ function Invoke-TaskKill {
     }
 }
 
+function Send-GracefulCtrlC {
+    param([int]$TargetPid)
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $psExe -PathType Leaf)) {
+        $psExe = 'powershell.exe'
+    }
+    $sigScript = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -Name CtrlSig -Namespace ZebotLauncher -MemberDefinition '
+[DllImport("kernel32.dll", SetLastError=true)] public static extern bool FreeConsole();
+[DllImport("kernel32.dll", SetLastError=true)] public static extern bool AttachConsole(uint dwProcessId);
+[DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetConsoleCtrlHandler(IntPtr HandlerRoutine, bool Add);
+[DllImport("kernel32.dll", SetLastError=true)] public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
+'
+`$null = [ZebotLauncher.CtrlSig]::FreeConsole()
+if ([ZebotLauncher.CtrlSig]::AttachConsole([uint32]$TargetPid)) {
+    `$null = [ZebotLauncher.CtrlSig]::SetConsoleCtrlHandler([IntPtr]::Zero, `$true)
+    `$ok = [ZebotLauncher.CtrlSig]::GenerateConsoleCtrlEvent(0, 0)
+    Start-Sleep -Milliseconds 100
+    `$null = [ZebotLauncher.CtrlSig]::FreeConsole()
+    if (`$ok) { exit 0 }
+}
+exit 1
+"@
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($sigScript))
+    try {
+        $helper = Start-Process -FilePath $psExe `
+            -ArgumentList '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded `
+            -WindowStyle Hidden `
+            -PassThru
+        if ($helper.WaitForExit(5000)) {
+            return ($helper.ExitCode -eq 0)
+        }
+        try { $helper.Kill() } catch {}
+    } catch {
+    }
+    return $false
+}
+
 function Stop-ProcessTreeList {
     param([object[]]$Targets)
     $rootPids = @($Targets | ForEach-Object { [int]$_.Pid })
@@ -665,9 +704,14 @@ function Stop-ProcessTreeList {
     $allTracked = @($Targets) + @($descendants)
 
     foreach ($target in $Targets) {
-        $gracefulExit = Invoke-TaskKill -Arguments @('/PID', [string]$target.Pid, '/T')
-        if ($gracefulExit -eq 0) {
+        if (Send-GracefulCtrlC -TargetPid $target.Pid) {
             $null = Wait-TrackedProcessesExit -Tracked @($target) -TimeoutMs 5000
+        }
+        if (Test-TrackedProcessAlive -ProcessId $target.Pid -ExpectedTicks $target.Ticks) {
+            $gracefulExit = Invoke-TaskKill -Arguments @('/PID', [string]$target.Pid, '/T')
+            if ($gracefulExit -eq 0) {
+                $null = Wait-TrackedProcessesExit -Tracked @($target) -TimeoutMs 2000
+            }
         }
         if (Test-TrackedProcessAlive -ProcessId $target.Pid -ExpectedTicks $target.Ticks) {
             $null = Invoke-TaskKill -Arguments @('/PID', [string]$target.Pid, '/T', '/F')
@@ -695,6 +739,132 @@ function Stop-ProcessTreeList {
     return [pscustomobject]@{
         Survivors = $survivors
         UserChildCount = $userChildCount
+    }
+}
+
+function Read-SharedFileTail {
+    param(
+        [string]$Path,
+        [ref]$ByteOffset
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return ''
+    }
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite
+        )
+        if ($stream.Length -le $ByteOffset.Value) {
+            return ''
+        }
+        $null = $stream.Seek($ByteOffset.Value, [System.IO.SeekOrigin]::Begin)
+        $toRead = [int]($stream.Length - $ByteOffset.Value)
+        $buffer = New-Object 'byte[]' $toRead
+        $readCount = $stream.Read($buffer, 0, $toRead)
+        if ($readCount -le 0) {
+            return ''
+        }
+        $ByteOffset.Value += $readCount
+        return [System.Text.Encoding]::UTF8.GetString($buffer, 0, $readCount)
+    } catch {
+        return ''
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
+function Register-InteractiveCloseGuard {
+    param(
+        [int]$TargetPid,
+        [string]$PidFilePath
+    )
+    try {
+        if (-not ('ZebotLauncher.ConsoleCloseGuard' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+
+namespace ZebotLauncher {
+    public static class ConsoleCloseGuard {
+        private delegate bool ConsoleCtrlHandler(uint ctrlType);
+        private static ConsoleCtrlHandler _handler;
+        private static int _targetPid;
+        private static string _pidFile;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetConsoleCtrlHandler(ConsoleCtrlHandler handler, bool add);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool FreeConsole();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AttachConsole(uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
+
+        public static void Install(int targetPid, string pidFile) {
+            _targetPid = targetPid;
+            _pidFile = pidFile;
+            _handler = OnCtrlEvent;
+            SetConsoleCtrlHandler(_handler, true);
+        }
+
+        public static void Clear() {
+            _targetPid = 0;
+        }
+
+        private static bool OnCtrlEvent(uint ctrlType) {
+            if (ctrlType != 2 && ctrlType != 5 && ctrlType != 6) {
+                return false;
+            }
+            int pid = _targetPid;
+            if (pid <= 0) {
+                return false;
+            }
+            _targetPid = 0;
+            try {
+                Process proc = null;
+                try { proc = Process.GetProcessById(pid); } catch { }
+                if (proc != null && !proc.HasExited) {
+                    FreeConsole();
+                    if (AttachConsole((uint)pid)) {
+                        SetConsoleCtrlHandler(IntPtr.Zero, true);
+                        GenerateConsoleCtrlEvent(0, 0);
+                        FreeConsole();
+                    }
+                    if (!proc.WaitForExit(3500)) {
+                        try {
+                            var tk = new ProcessStartInfo("taskkill.exe", "/PID " + pid + " /T /F");
+                            tk.CreateNoWindow = true;
+                            tk.UseShellExecute = false;
+                            using (var k = Process.Start(tk)) {
+                                if (k != null) { k.WaitForExit(1500); }
+                            }
+                        } catch { }
+                    }
+                }
+                if (!string.IsNullOrEmpty(_pidFile) && File.Exists(_pidFile)) {
+                    try { File.Delete(_pidFile); } catch { }
+                }
+            } catch { }
+            return false;
+        }
+    }
+}
+'@
+        }
+        [ZebotLauncher.ConsoleCloseGuard]::Install($TargetPid, $PidFilePath)
+    } catch {
     }
 }
 
@@ -744,45 +914,29 @@ function Invoke-InteractiveRun {
     Remove-Item -LiteralPath $stdoutLog -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $stderrLog -Force -ErrorAction SilentlyContinue
 
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    $stdoutStream = $null
-    $stderrStream = $null
-    $stdoutWriter = $null
-    $stderrWriter = $null
     $proc = $null
     $trackedTicks = [long]0
     $stopRequested = $false
+    [long]$stdoutOffset = 0
+    [long]$stderrOffset = 0
 
     try {
-        $stdoutStream = [System.IO.File]::Open($stdoutLog, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
-        $stderrStream = [System.IO.File]::Open($stderrLog, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
-        $stdoutWriter = New-Object System.IO.StreamWriter($stdoutStream, $utf8NoBom)
-        $stderrWriter = New-Object System.IO.StreamWriter($stderrStream, $utf8NoBom)
-        $stdoutWriter.AutoFlush = $true
-        $stderrWriter.AutoFlush = $true
+        $proc = Start-Process -FilePath $exePath `
+            -WorkingDirectory $repoRoot `
+            -RedirectStandardOutput $stdoutLog `
+            -RedirectStandardError $stderrLog `
+            -WindowStyle Hidden `
+            -PassThru
 
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $exePath
-        $psi.WorkingDirectory = $repoRoot
-        $psi.UseShellExecute = $false
-        $psi.CreateNoWindow = $false
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
-        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-        $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
-
-        $proc = [System.Diagnostics.Process]::Start($psi)
         $cim = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue
         $trackedTicks = Get-ProcessCreationTicks $cim
         Write-PidState -ProcessId $proc.Id -StartTimeUtcTicks $trackedTicks
+        Register-InteractiveCloseGuard -TargetPid $proc.Id -PidFilePath $pidFile
 
         Write-Output "Starting Zebot (PID $($proc.Id))..."
         Write-Output 'Press Enter or close this window to stop Zebot.'
         Write-Output '(To run in the background, use: launch.bat start)'
         Write-Output ''
-
-        $stdoutTask = $proc.StandardOutput.ReadLineAsync()
-        $stderrTask = $proc.StandardError.ReadLineAsync()
 
         $inputRedirected = [Console]::IsInputRedirected
         $stdinTask = $null
@@ -795,26 +949,13 @@ function Invoke-InteractiveRun {
         }
 
         while (-not $proc.HasExited) {
-            while ($null -ne $stdoutTask -and $stdoutTask.IsCompleted) {
-                $line = $stdoutTask.GetAwaiter().GetResult()
-                if ($null -eq $line) {
-                    $stdoutTask = $null
-                } else {
-                    $stdoutWriter.WriteLine($line)
-                    Write-Output $line
-                    $stdoutTask = $proc.StandardOutput.ReadLineAsync()
-                }
+            $outChunk = Read-SharedFileTail -Path $stdoutLog -ByteOffset ([ref]$stdoutOffset)
+            if ($outChunk.Length -gt 0) {
+                [Console]::Out.Write($outChunk)
             }
-
-            while ($null -ne $stderrTask -and $stderrTask.IsCompleted) {
-                $errLine = $stderrTask.GetAwaiter().GetResult()
-                if ($null -eq $errLine) {
-                    $stderrTask = $null
-                } else {
-                    $stderrWriter.WriteLine($errLine)
-                    Write-Output $errLine
-                    $stderrTask = $proc.StandardError.ReadLineAsync()
-                }
+            $errChunk = Read-SharedFileTail -Path $stderrLog -ByteOffset ([ref]$stderrOffset)
+            if ($errChunk.Length -gt 0) {
+                [Console]::Out.Write($errChunk)
             }
 
             if ($inputRedirected) {
@@ -839,6 +980,9 @@ function Invoke-InteractiveRun {
         }
 
         if ($stopRequested) {
+            if ('ZebotLauncher.ConsoleCloseGuard' -as [type]) {
+                [ZebotLauncher.ConsoleCloseGuard]::Clear()
+            }
             Write-Output ''
             Write-Output "Stopping Zebot (PID $($proc.Id))..."
             $target = [pscustomobject]@{
@@ -847,6 +991,14 @@ function Invoke-InteractiveRun {
                 Ticks = $trackedTicks
             }
             $stopResult = Stop-ProcessTreeList -Targets @($target)
+            $outTail = Read-SharedFileTail -Path $stdoutLog -ByteOffset ([ref]$stdoutOffset)
+            if ($outTail.Length -gt 0) {
+                [Console]::Out.Write($outTail)
+            }
+            $errTail = Read-SharedFileTail -Path $stderrLog -ByteOffset ([ref]$stderrOffset)
+            if ($errTail.Length -gt 0) {
+                [Console]::Out.Write($errTail)
+            }
             Remove-PidState
             if ($stopResult.Survivors.Count -gt 0) {
                 $remPids = ($stopResult.Survivors | ForEach-Object { $_.Pid }) -join ', '
@@ -858,19 +1010,13 @@ function Invoke-InteractiveRun {
         }
 
         $null = $proc.WaitForExit(1000)
-        while ($null -ne $stdoutTask -and $stdoutTask.Wait(200)) {
-            $line = $stdoutTask.GetAwaiter().GetResult()
-            if ($null -eq $line) { break }
-            $stdoutWriter.WriteLine($line)
-            Write-Output $line
-            $stdoutTask = $proc.StandardOutput.ReadLineAsync()
+        $outTail = Read-SharedFileTail -Path $stdoutLog -ByteOffset ([ref]$stdoutOffset)
+        if ($outTail.Length -gt 0) {
+            [Console]::Out.Write($outTail)
         }
-        while ($null -ne $stderrTask -and $stderrTask.Wait(200)) {
-            $errLine = $stderrTask.GetAwaiter().GetResult()
-            if ($null -eq $errLine) { break }
-            $stderrWriter.WriteLine($errLine)
-            Write-Output $errLine
-            $stderrTask = $proc.StandardError.ReadLineAsync()
+        $errTail = Read-SharedFileTail -Path $stderrLog -ByteOffset ([ref]$stderrOffset)
+        if ($errTail.Length -gt 0) {
+            [Console]::Out.Write($errTail)
         }
 
         $exitCode = [int]$proc.ExitCode
@@ -885,6 +1031,9 @@ function Invoke-InteractiveRun {
         Write-Output 'Zebot stopped.'
         exit 0
     } finally {
+        if ('ZebotLauncher.ConsoleCloseGuard' -as [type]) {
+            try { [ZebotLauncher.ConsoleCloseGuard]::Clear() } catch {}
+        }
         if ($null -ne $proc) {
             try {
                 if (-not $proc.HasExited) {
@@ -900,10 +1049,6 @@ function Invoke-InteractiveRun {
             Remove-PidState
             try { $proc.Dispose() } catch {}
         }
-        if ($null -ne $stdoutWriter) { try { $stdoutWriter.Dispose() } catch {} }
-        elseif ($null -ne $stdoutStream) { try { $stdoutStream.Dispose() } catch {} }
-        if ($null -ne $stderrWriter) { try { $stderrWriter.Dispose() } catch {} }
-        elseif ($null -ne $stderrStream) { try { $stderrStream.Dispose() } catch {} }
     }
 }
 
