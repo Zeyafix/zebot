@@ -136,11 +136,13 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-To run Zebot directly in the foreground during development (runs `.env` and external tool preflight checks, connects to Discord, registers `/status`, `/play`, `/stop`, and `/leave` in `DISCORD_GUILD_ID`, and shuts down cleanly on `Ctrl+C`):
+To run Zebot directly in the foreground during development (runs `.env` and external tool preflight checks, connects to Discord, registers `/status`, `/play`, `/stop`, and `/leave` in `DISCORD_GUILD_ID`, starts the local HTTP/JSON API on `127.0.0.1:<API_PORT>`, and shuts down cleanly on `Ctrl+C`):
 
 ```powershell
 cargo run
 ```
+
+For local HTTP/JSON API endpoints, authentication details, and copy-pasteable host/AI agent examples, see [Local HTTP/JSON API](local-api.md).
 
 ## 7. Code Guardrails
 
