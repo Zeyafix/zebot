@@ -1313,17 +1313,19 @@ mod tests {
     }
 
     impl VoiceBackend for RecordingBackend {
+        type PreparedStream = ();
+
         async fn resolve_track(
             &self,
             url: &YouTubeUrl,
             _cancel: CancellationToken,
-        ) -> Result<TrackMetadata, VoiceBackendError> {
-            Ok(TrackMetadata {
+        ) -> Result<crate::core::ResolvedTrack<Self::PreparedStream>, VoiceBackendError> {
+            Ok(crate::core::ResolvedTrack::without_stream(TrackMetadata {
                 url: url.clone(),
                 title: Some("Sample Song".to_string()),
                 channel: Some("Sample Artist".to_string()),
                 duration_seconds: Some(213),
-            })
+            }))
         }
 
         async fn join(
@@ -1341,14 +1343,14 @@ mod tests {
         async fn play(
             &self,
             _target: VoiceTarget,
-            track: &TrackMetadata,
+            track: crate::core::ResolvedTrack<Self::PreparedStream>,
             _generation: PlaybackGeneration,
             _cancel: CancellationToken,
         ) -> Result<(), VoiceBackendError> {
             self.play_video_ids
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push(track.url.video_id().to_string());
+                .push(track.metadata.url.video_id().to_string());
             Ok(())
         }
 

@@ -17,7 +17,7 @@ use zebot::api::{
     VoiceDirectoryError,
 };
 use zebot::core::{
-    AppCore, CancellationToken, PlaybackGeneration, VoiceBackend, VoiceBackendError,
+    AppCore, CancellationToken, PlaybackGeneration, ResolvedTrack, VoiceBackend, VoiceBackendError,
 };
 use zebot::discord::{
     CommandScope, PlayCommandContext, execute_leave_command, execute_play_command,
@@ -100,11 +100,13 @@ impl FakeVoiceBackend {
 }
 
 impl VoiceBackend for FakeVoiceBackend {
+    type PreparedStream = ();
+
     async fn resolve_track(
         &self,
         url: &YouTubeUrl,
         cancel: CancellationToken,
-    ) -> Result<TrackMetadata, VoiceBackendError> {
+    ) -> Result<ResolvedTrack<Self::PreparedStream>, VoiceBackendError> {
         let video_id = url.video_id().to_string();
         let (planned_error, gate) = {
             let mut state = self.lock();
@@ -136,12 +138,12 @@ impl VoiceBackend for FakeVoiceBackend {
             return Err(VoiceBackendError::ResolveFailed(reason));
         }
 
-        Ok(TrackMetadata {
+        Ok(ResolvedTrack::without_stream(TrackMetadata {
             url: url.clone(),
             title: Some(format!("Track {video_id}")),
             channel: Some("Zebot Test Artist".to_string()),
             duration_seconds: Some(185),
-        })
+        }))
     }
 
     async fn join(
@@ -161,7 +163,7 @@ impl VoiceBackend for FakeVoiceBackend {
     async fn play(
         &self,
         target: VoiceTarget,
-        track: &TrackMetadata,
+        track: ResolvedTrack<Self::PreparedStream>,
         _generation: PlaybackGeneration,
         cancel: CancellationToken,
     ) -> Result<(), VoiceBackendError> {
@@ -170,7 +172,7 @@ impl VoiceBackend for FakeVoiceBackend {
         }
         self.lock().actions.push(RecordedBackendAction::Play {
             target,
-            video_id: track.url.video_id().to_string(),
+            video_id: track.metadata.url.video_id().to_string(),
         });
         Ok(())
     }
