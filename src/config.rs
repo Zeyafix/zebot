@@ -17,6 +17,7 @@ const ENV_API_TOKEN: &str = "API_TOKEN";
 const ENV_API_PORT: &str = "API_PORT";
 const ENV_YT_DLP_PATH: &str = "YT_DLP_PATH";
 const ENV_FFMPEG_PATH: &str = "FFMPEG_PATH";
+const UTF8_BOM: char = '\u{FEFF}';
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
@@ -202,6 +203,7 @@ fn load_dotenv_file(path: &Path) -> Result<HashMap<String, String>, ConfigError>
 
 pub fn parse_dotenv(content: &str) -> Result<HashMap<String, String>, (usize, String)> {
     let mut values = HashMap::new();
+    let content = content.strip_prefix(UTF8_BOM).unwrap_or(content);
 
     for (zero_based_index, raw_line) in content.lines().enumerate() {
         let line_number = zero_based_index + 1;
@@ -390,11 +392,37 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
         Config, ConfigError, ConfigIssue, DEFAULT_API_PORT, DEFAULT_FFMPEG_PATH,
-        DEFAULT_YT_DLP_PATH, parse_dotenv,
+        DEFAULT_YT_DLP_PATH, load_dotenv_file, parse_dotenv,
     };
+
+    static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempEnvDir {
+        path: PathBuf,
+    }
+
+    impl TempEnvDir {
+        fn create(label: &str) -> Self {
+            let id = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path =
+                PathBuf::from("temp").join(format!("zebot-config-{label}-{}-{id}", process::id()));
+            fs::create_dir_all(&path).expect("create temp test directory");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempEnvDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     fn base_env() -> HashMap<String, String> {
         HashMap::from([
@@ -528,6 +556,59 @@ mod tests {
             Some("single=secret")
         );
         assert_eq!(parsed.get("API_PORT").map(String::as_str), Some("8181"));
+    }
+
+    #[test]
+    fn parses_dotenv_with_leading_utf8_bom_before_assignment() {
+        let raw = "\u{FEFF}DISCORD_TOKEN=discord-secret\r\nAPI_TOKEN=api-secret\r\n";
+
+        let parsed = parse_dotenv(raw).unwrap();
+        assert_eq!(
+            parsed.get("DISCORD_TOKEN").map(String::as_str),
+            Some("discord-secret")
+        );
+        assert_eq!(
+            parsed.get("API_TOKEN").map(String::as_str),
+            Some("api-secret")
+        );
+        assert!(!parsed.contains_key("\u{FEFF}DISCORD_TOKEN"));
+
+        let exported = parse_dotenv("\u{FEFF}export DISCORD_TOKEN=exported-secret\n").unwrap();
+        assert_eq!(
+            exported.get("DISCORD_TOKEN").map(String::as_str),
+            Some("exported-secret")
+        );
+    }
+
+    #[test]
+    fn parses_dotenv_with_leading_utf8_bom_before_comment() {
+        let raw = "\u{FEFF}# comment line\r\nDISCORD_TOKEN=discord-secret\r\n";
+
+        let parsed = parse_dotenv(raw).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed.get("DISCORD_TOKEN").map(String::as_str),
+            Some("discord-secret")
+        );
+    }
+
+    #[test]
+    fn parses_bom_only_dotenv_as_empty() {
+        assert!(parse_dotenv("\u{FEFF}").unwrap().is_empty());
+        assert!(parse_dotenv("\u{FEFF}\r\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn loads_dotenv_file_saved_with_utf8_bom_bytes() {
+        let temp = TempEnvDir::create("utf8-bom");
+        let env_path = temp.path.join(".env");
+        fs::write(&env_path, b"\xEF\xBB\xBFDISCORD_TOKEN=windows-secret\r\n").unwrap();
+
+        let parsed = load_dotenv_file(&env_path).unwrap();
+        assert_eq!(
+            parsed.get("DISCORD_TOKEN").map(String::as_str),
+            Some("windows-secret")
+        );
     }
 
     #[test]
