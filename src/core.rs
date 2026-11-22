@@ -142,12 +142,35 @@ impl<B: Send + Sync> VoiceLifecycleListener for AppCore<B> {
     }
 }
 
+#[derive(Debug)]
+pub struct ResolvedTrack<P = ()> {
+    pub metadata: TrackMetadata,
+    pub prepared: P,
+}
+
+impl ResolvedTrack<()> {
+    pub fn without_stream(metadata: TrackMetadata) -> Self {
+        Self {
+            metadata,
+            prepared: (),
+        }
+    }
+}
+
+impl<P> ResolvedTrack<P> {
+    pub fn new(metadata: TrackMetadata, prepared: P) -> Self {
+        Self { metadata, prepared }
+    }
+}
+
 pub trait VoiceBackend: Send + Sync {
+    type PreparedStream: Send;
+
     fn resolve_track(
         &self,
         url: &YouTubeUrl,
         cancel: CancellationToken,
-    ) -> impl Future<Output = Result<TrackMetadata, VoiceBackendError>> + Send;
+    ) -> impl Future<Output = Result<ResolvedTrack<Self::PreparedStream>, VoiceBackendError>> + Send;
 
     fn join(
         &self,
@@ -158,10 +181,14 @@ pub trait VoiceBackend: Send + Sync {
     fn play(
         &self,
         target: VoiceTarget,
-        track: &TrackMetadata,
+        track: ResolvedTrack<Self::PreparedStream>,
         generation: PlaybackGeneration,
         cancel: CancellationToken,
     ) -> impl Future<Output = Result<(), VoiceBackendError>> + Send;
+
+    fn discard_prepared(&self, _prepared: Self::PreparedStream) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 
     fn stop(&self, guild_id: GuildId)
     -> impl Future<Output = Result<(), VoiceBackendError>> + Send;
@@ -173,11 +200,14 @@ pub trait VoiceBackend: Send + Sync {
 }
 
 impl<B: VoiceBackend> VoiceBackend for Arc<B> {
+    type PreparedStream = B::PreparedStream;
+
     fn resolve_track(
         &self,
         url: &YouTubeUrl,
         cancel: CancellationToken,
-    ) -> impl Future<Output = Result<TrackMetadata, VoiceBackendError>> + Send {
+    ) -> impl Future<Output = Result<ResolvedTrack<Self::PreparedStream>, VoiceBackendError>> + Send
+    {
         (**self).resolve_track(url, cancel)
     }
 
@@ -192,11 +222,15 @@ impl<B: VoiceBackend> VoiceBackend for Arc<B> {
     fn play(
         &self,
         target: VoiceTarget,
-        track: &TrackMetadata,
+        track: ResolvedTrack<Self::PreparedStream>,
         generation: PlaybackGeneration,
         cancel: CancellationToken,
     ) -> impl Future<Output = Result<(), VoiceBackendError>> + Send {
         (**self).play(target, track, generation, cancel)
+    }
+
+    fn discard_prepared(&self, prepared: Self::PreparedStream) -> impl Future<Output = ()> + Send {
+        (**self).discard_prepared(prepared)
     }
 
     fn stop(
@@ -218,11 +252,13 @@ impl<B: VoiceBackend> VoiceBackend for Arc<B> {
 pub struct UnavailableVoiceBackend;
 
 impl VoiceBackend for UnavailableVoiceBackend {
+    type PreparedStream = ();
+
     async fn resolve_track(
         &self,
         _url: &YouTubeUrl,
         _cancel: CancellationToken,
-    ) -> Result<TrackMetadata, VoiceBackendError> {
+    ) -> Result<ResolvedTrack<Self::PreparedStream>, VoiceBackendError> {
         Err(VoiceBackendError::ResolveFailed(
             "voice backend is not configured".to_string(),
         ))
@@ -241,7 +277,7 @@ impl VoiceBackend for UnavailableVoiceBackend {
     async fn play(
         &self,
         _target: VoiceTarget,
-        _track: &TrackMetadata,
+        _track: ResolvedTrack<Self::PreparedStream>,
         _generation: PlaybackGeneration,
         _cancel: CancellationToken,
     ) -> Result<(), VoiceBackendError> {
@@ -413,6 +449,7 @@ impl<B: VoiceBackend> AppCore<B> {
         };
 
         if !self.is_current_generation(op_gen) || cancel.is_cancelled() {
+            self.backend.discard_prepared(resolved_track.prepared).await;
             self.clear_loading_if_current(op_gen);
             return Err(CoreError::Cancelled);
         }
@@ -420,6 +457,7 @@ impl<B: VoiceBackend> AppCore<B> {
         let _voice_guard = self.voice_op_lock.lock().await;
 
         if !self.is_current_generation(op_gen) || cancel.is_cancelled() {
+            self.backend.discard_prepared(resolved_track.prepared).await;
             self.clear_loading_if_current(op_gen);
             return Err(CoreError::Cancelled);
         }
@@ -431,6 +469,7 @@ impl<B: VoiceBackend> AppCore<B> {
 
         if backend_playing && let Some(active_voice) = current_voice {
             if let Err(error) = self.backend.stop(active_voice.guild_id).await {
+                self.backend.discard_prepared(resolved_track.prepared).await;
                 self.clear_loading_if_current(op_gen);
                 return Err(CoreError::Backend(error));
             }
@@ -438,6 +477,7 @@ impl<B: VoiceBackend> AppCore<B> {
         }
 
         if !self.is_current_generation(op_gen) || cancel.is_cancelled() {
+            self.backend.discard_prepared(resolved_track.prepared).await;
             self.clear_loading_if_current(op_gen);
             return Err(CoreError::Cancelled);
         }
@@ -447,6 +487,7 @@ impl<B: VoiceBackend> AppCore<B> {
                 && previous_voice.guild_id != request.target.guild_id
             {
                 if let Err(error) = self.backend.leave(previous_voice.guild_id).await {
+                    self.backend.discard_prepared(resolved_track.prepared).await;
                     self.clear_loading_if_current(op_gen);
                     return Err(CoreError::Backend(error));
                 }
@@ -454,6 +495,7 @@ impl<B: VoiceBackend> AppCore<B> {
             }
 
             if let Err(error) = self.backend.join(request.target, cancel.clone()).await {
+                self.backend.discard_prepared(resolved_track.prepared).await;
                 if !self.is_current_generation(op_gen) || cancel.is_cancelled() {
                     self.clear_loading_if_current(op_gen);
                     return Err(CoreError::Cancelled);
@@ -465,14 +507,16 @@ impl<B: VoiceBackend> AppCore<B> {
             self.lock_state().voice_target = Some(request.target);
 
             if !self.is_current_generation(op_gen) || cancel.is_cancelled() {
+                self.backend.discard_prepared(resolved_track.prepared).await;
                 self.clear_loading_if_current(op_gen);
                 return Err(CoreError::Cancelled);
             }
         }
 
+        let track_metadata = resolved_track.metadata.clone();
         match self
             .backend
-            .play(request.target, &resolved_track, op_gen, cancel.clone())
+            .play(request.target, resolved_track, op_gen, cancel.clone())
             .await
         {
             Ok(()) => {
@@ -481,7 +525,7 @@ impl<B: VoiceBackend> AppCore<B> {
                     if state.is_current(op_gen) && !cancel.is_cancelled() {
                         state.backend_playing = true;
                         state.playback_state = PlaybackState::Playing;
-                        state.active_track = Some(resolved_track);
+                        state.active_track = Some(track_metadata);
                         Some(state.snapshot())
                     } else {
                         state.backend_playing = true;
@@ -658,7 +702,8 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{
-        AppCore, CancellationToken, CoreError, PlaybackGeneration, VoiceBackend, VoiceBackendError,
+        AppCore, CancellationToken, CoreError, PlaybackGeneration, ResolvedTrack, VoiceBackend,
+        VoiceBackendError,
     };
     use crate::state::{
         DiscordConnectionState, GuildId, PlayRequest, PlaybackState, TrackMetadata, VoiceChannelId,
@@ -670,6 +715,7 @@ mod tests {
     enum BackendEvent {
         ResolveStart(String),
         ResolveCancelled(String),
+        DiscardPrepared(String),
         Join(VoiceTarget),
         Play {
             target: VoiceTarget,
@@ -699,6 +745,7 @@ mod tests {
     struct MockBackendState {
         events: Vec<BackendEvent>,
         resolve_gates: HashMap<String, AsyncGate>,
+        join_gates: HashMap<VoiceChannelId, AsyncGate>,
         play_gates: HashMap<String, AsyncGate>,
         resolve_errors: HashMap<String, String>,
         join_errors: HashMap<VoiceChannelId, String>,
@@ -730,6 +777,12 @@ mod tests {
             gate
         }
 
+        fn install_join_gate(&self, channel_id: VoiceChannelId) -> AsyncGate {
+            let gate = AsyncGate::new();
+            self.lock().join_gates.insert(channel_id, gate.clone());
+            gate
+        }
+
         fn install_play_gate(&self, video_id: &str) -> AsyncGate {
             let gate = AsyncGate::new();
             self.lock()
@@ -752,11 +805,13 @@ mod tests {
     }
 
     impl VoiceBackend for MockVoiceBackend {
+        type PreparedStream = String;
+
         async fn resolve_track(
             &self,
             url: &YouTubeUrl,
             cancel: CancellationToken,
-        ) -> Result<TrackMetadata, VoiceBackendError> {
+        ) -> Result<ResolvedTrack<Self::PreparedStream>, VoiceBackendError> {
             let video_id = url.video_id().to_string();
             let (gate, planned_error) = {
                 let mut state = self.lock();
@@ -794,12 +849,15 @@ mod tests {
                 return Err(VoiceBackendError::ResolveFailed(reason));
             }
 
-            Ok(TrackMetadata {
-                url: url.clone(),
-                title: Some(format!("Title for {video_id}")),
-                channel: Some("Test Channel".to_string()),
-                duration_seconds: Some(180),
-            })
+            Ok(ResolvedTrack::new(
+                TrackMetadata {
+                    url: url.clone(),
+                    title: Some(format!("Title for {video_id}")),
+                    channel: Some("Test Channel".to_string()),
+                    duration_seconds: Some(180),
+                },
+                video_id,
+            ))
         }
 
         async fn join(
@@ -811,11 +869,25 @@ mod tests {
                 return Err(VoiceBackendError::Cancelled);
             }
 
-            let planned_error = {
+            let (gate, planned_error) = {
                 let mut state = self.lock();
                 state.events.push(BackendEvent::Join(target));
-                state.join_errors.get(&target.channel_id).cloned()
+                (
+                    state.join_gates.get(&target.channel_id).cloned(),
+                    state.join_errors.get(&target.channel_id).cloned(),
+                )
             };
+
+            if let Some(gate) = gate {
+                gate.started.notify_waiters();
+                let released = tokio::select! {
+                    () = cancel.cancelled() => false,
+                    () = gate.release.notified() => true,
+                };
+                if !released {
+                    return Err(VoiceBackendError::Cancelled);
+                }
+            }
 
             if let Some(reason) = planned_error {
                 return Err(VoiceBackendError::JoinFailed(reason));
@@ -827,15 +899,16 @@ mod tests {
         async fn play(
             &self,
             target: VoiceTarget,
-            track: &TrackMetadata,
+            track: ResolvedTrack<Self::PreparedStream>,
             generation: PlaybackGeneration,
             cancel: CancellationToken,
         ) -> Result<(), VoiceBackendError> {
             if cancel.is_cancelled() {
+                self.discard_prepared(track.prepared).await;
                 return Err(VoiceBackendError::Cancelled);
             }
 
-            let video_id = track.url.video_id().to_string();
+            let video_id = track.metadata.url.video_id().to_string();
             let gate = {
                 let mut state = self.lock();
                 state.events.push(BackendEvent::Play {
@@ -852,6 +925,12 @@ mod tests {
             }
 
             Ok(())
+        }
+
+        async fn discard_prepared(&self, prepared: Self::PreparedStream) {
+            self.lock()
+                .events
+                .push(BackendEvent::DiscardPrepared(prepared));
         }
 
         async fn stop(&self, guild_id: GuildId) -> Result<(), VoiceBackendError> {
@@ -1509,5 +1588,82 @@ mod tests {
 
         let after_leave = core.leave().await.unwrap();
         assert_eq!(after_leave.voice_target, None);
+    }
+
+    #[tokio::test]
+    async fn join_failure_discards_prepared_stream_cleanly() {
+        let backend = MockVoiceBackend::new();
+        let guild_id = guild(14);
+        let failed_channel = channel(140);
+        backend.fail_join(failed_channel, "voice gateway rejected connection");
+
+        let core = AppCore::new(Arc::clone(&backend));
+        let error = core
+            .play(PlayRequest::new(
+                guild_id,
+                failed_channel,
+                "https://www.youtube.com/watch?v=discardJoin1",
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            CoreError::Backend(VoiceBackendError::JoinFailed(
+                "voice gateway rejected connection".to_string()
+            ))
+        );
+        assert_eq!(core.status().playback_state, PlaybackState::Idle);
+        assert_eq!(core.status().active_track, None);
+        assert_eq!(core.status().voice_target, None);
+        assert!(
+            backend
+                .events()
+                .contains(&BackendEvent::DiscardPrepared("discardJoin1".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_join_discards_prepared_stream_cleanly() {
+        let backend = MockVoiceBackend::new();
+        let guild_id = guild(15);
+        let slow_channel = channel(150);
+        let join_gate = backend.install_join_gate(slow_channel);
+        let core = Arc::new(AppCore::new(Arc::clone(&backend)));
+
+        let join_started = join_gate.started.notified();
+        tokio::pin!(join_started);
+        join_started.as_mut().enable();
+
+        let core_play = Arc::clone(&core);
+        let play_task = tokio::spawn(async move {
+            core_play
+                .play(PlayRequest::new(
+                    guild_id,
+                    slow_channel,
+                    "https://www.youtube.com/watch?v=cancelJoin01",
+                ))
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), join_started)
+            .await
+            .unwrap();
+
+        let stopped = core.stop().await.unwrap();
+        assert_eq!(stopped.playback_state, PlaybackState::Idle);
+        assert_eq!(stopped.active_track, None);
+
+        let play_result = tokio::time::timeout(Duration::from_secs(2), play_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(play_result, Err(CoreError::Cancelled));
+
+        let events = backend.events();
+        assert!(events.contains(&BackendEvent::DiscardPrepared("cancelJoin01".to_string())));
+        assert!(!events.iter().any(
+            |event| matches!(event, BackendEvent::Play { video_id, .. } if video_id == "cancelJoin01")
+        ));
     }
 }

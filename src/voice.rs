@@ -20,12 +20,16 @@ use songbird::input::core::io::MediaSource;
 use songbird::input::{AsyncAdapterStream, AsyncMediaSource, Input, RawAdapter};
 use songbird::tracks::TrackHandle;
 use songbird::{Config as SongbirdConfig, Songbird};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, ReadBuf};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeek, BufReader, ReadBuf,
+};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::runtime::Handle;
+use tokio::task::JoinHandle;
 
 use crate::core::{
-    CancellationToken, PlaybackGeneration, VoiceBackend, VoiceBackendError, VoiceLifecycleListener,
+    CancellationToken, PlaybackGeneration, ResolvedTrack, VoiceBackend, VoiceBackendError,
+    VoiceLifecycleListener,
 };
 use crate::state::{GuildId, TrackMetadata, VoiceChannelId, VoiceTarget};
 use crate::youtube::YouTubeUrl;
@@ -36,22 +40,12 @@ pub const STREAM_RING_BUFFER_BYTES: usize = 128 * 1024;
 pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_METADATA_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_STDERR_OUTPUT_BYTES: usize = 64 * 1024;
+pub const YT_DLP_METADATA_PREFIX: &str = "ZEBOT_META:";
+pub const YT_DLP_METADATA_PRINT_TEMPLATE: &str =
+    "before_dl:ZEBOT_META:%(.{title,channel,uploader,duration})j";
 
 pub fn build_songbird_config() -> SongbirdConfig {
     SongbirdConfig::default().crypto_mode(CryptoMode::Aes256Gcm)
-}
-
-pub fn build_yt_dlp_metadata_args(url: &YouTubeUrl) -> Vec<String> {
-    vec![
-        "--no-playlist".to_string(),
-        "--no-warnings".to_string(),
-        "--skip-download".to_string(),
-        "--dump-single-json".to_string(),
-        "-f".to_string(),
-        "bestaudio/best".to_string(),
-        "--".to_string(),
-        url.as_str().to_string(),
-    ]
 }
 
 pub fn build_yt_dlp_stream_args(url: &YouTubeUrl) -> Vec<String> {
@@ -60,6 +54,10 @@ pub fn build_yt_dlp_stream_args(url: &YouTubeUrl) -> Vec<String> {
         "--no-warnings".to_string(),
         "--no-part".to_string(),
         "--no-cache-dir".to_string(),
+        "--no-progress".to_string(),
+        "--no-simulate".to_string(),
+        "--print".to_string(),
+        YT_DLP_METADATA_PRINT_TEMPLATE.to_string(),
         "-f".to_string(),
         "bestaudio/best".to_string(),
         "-o".to_string(),
@@ -118,6 +116,26 @@ pub fn parse_yt_dlp_metadata(
     })
 }
 
+pub fn parse_yt_dlp_metadata_line(
+    url: &YouTubeUrl,
+    raw_line: &[u8],
+) -> Option<Result<TrackMetadata, VoiceBackendError>> {
+    let trimmed = trim_line_endings(raw_line);
+    let payload = trimmed.strip_prefix(YT_DLP_METADATA_PREFIX.as_bytes())?;
+    Some(parse_yt_dlp_metadata(url, payload))
+}
+
+fn trim_line_endings(mut line: &[u8]) -> &[u8] {
+    while let Some(&last) = line.last() {
+        if last == b'\n' || last == b'\r' {
+            line = &line[..line.len() - 1];
+        } else {
+            break;
+        }
+    }
+    line
+}
+
 fn normalize_optional_text(value: Option<String>) -> Option<String> {
     value.and_then(|raw| {
         let trimmed = raw.trim();
@@ -150,40 +168,201 @@ fn first_non_empty_line(bytes: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
-async fn read_stream_bounded<R>(mut reader: R, max_bytes: usize) -> io::Result<Vec<u8>>
+fn append_bounded_diagnostic_line(buffer: &mut Vec<u8>, line: &[u8], max_bytes: usize) {
+    let trimmed = trim_line_endings(line);
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let remaining = max_bytes.saturating_sub(buffer.len());
+    if remaining == 0 {
+        return;
+    }
+
+    let take = trimmed.len().min(remaining);
+    buffer.extend_from_slice(&trimmed[..take]);
+    if buffer.len() < max_bytes {
+        buffer.push(b'\n');
+    }
+}
+
+enum BoundedLine {
+    Eof,
+    Line(Vec<u8>),
+    TooLong,
+}
+
+async fn read_bounded_line<R>(reader: &mut R, max_bytes: usize) -> io::Result<BoundedLine>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = Vec::new();
+
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(BoundedLine::Eof);
+            }
+            return Ok(BoundedLine::Line(line));
+        }
+
+        if let Some(newline_index) = available.iter().position(|&byte| byte == b'\n') {
+            let segment = &available[..=newline_index];
+            let consumed = newline_index + 1;
+            if line.len().saturating_add(segment.len()) > max_bytes {
+                reader.consume(consumed);
+                return Ok(BoundedLine::TooLong);
+            }
+            line.extend_from_slice(segment);
+            reader.consume(consumed);
+            return Ok(BoundedLine::Line(line));
+        }
+
+        let chunk_len = available.len();
+        if line.len().saturating_add(chunk_len) > max_bytes {
+            reader.consume(chunk_len);
+            return Ok(BoundedLine::TooLong);
+        }
+        line.extend_from_slice(available);
+        reader.consume(chunk_len);
+    }
+}
+
+async fn drain_reader_to_eof<R>(mut reader: R)
 where
     R: AsyncRead + Unpin,
 {
-    let mut output = Vec::new();
-    let mut chunk = [0u8; 8192];
-
+    let mut sink = [0u8; 4096];
     loop {
-        let read_count = reader.read(&mut chunk).await?;
-        if read_count == 0 {
-            break;
-        }
-
-        let remaining = max_bytes.saturating_sub(output.len());
-        if remaining > 0 {
-            let take = read_count.min(remaining);
-            output.extend_from_slice(&chunk[..take]);
+        match reader.read(&mut sink).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
         }
     }
+}
 
-    Ok(output)
+#[cfg(windows)]
+async fn taskkill_process_tree_async(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
+#[cfg(windows)]
+fn taskkill_process_tree_blocking(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 async fn terminate_child(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        taskkill_process_tree_async(pid).await;
+    }
+
     let _ = child.kill().await;
 }
 
-pub async fn resolve_track_with_command(
+fn terminate_child_now(mut child: Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+
+    #[cfg(windows)]
+    let pid = child.id();
+
+    #[cfg(not(windows))]
+    let _ = child.start_kill();
+
+    if let Ok(handle) = Handle::try_current() {
+        handle.spawn(async move {
+            #[cfg(windows)]
+            if let Some(pid) = pid {
+                taskkill_process_tree_async(pid).await;
+            }
+            let _ = child.kill().await;
+        });
+    } else {
+        #[cfg(windows)]
+        if let Some(pid) = pid {
+            taskkill_process_tree_blocking(pid);
+        }
+        let _ = child.start_kill();
+    }
+}
+
+struct PreparedYtDlpInner {
+    yt_dlp: Child,
+    yt_stdout: ChildStdout,
+    stderr_drain: JoinHandle<()>,
+}
+
+pub struct PreparedYtDlpStream {
+    inner: Option<PreparedYtDlpInner>,
+}
+
+impl PreparedYtDlpStream {
+    fn new(yt_dlp: Child, yt_stdout: ChildStdout, stderr_drain: JoinHandle<()>) -> Self {
+        Self {
+            inner: Some(PreparedYtDlpInner {
+                yt_dlp,
+                yt_stdout,
+                stderr_drain,
+            }),
+        }
+    }
+
+    pub fn yt_dlp_pid(&self) -> Option<u32> {
+        self.inner.as_ref().and_then(|inner| inner.yt_dlp.id())
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    pub async fn terminate_async(mut self) {
+        if let Some(mut inner) = self.inner.take() {
+            inner.stderr_drain.abort();
+            drop(inner.yt_stdout);
+            terminate_child(&mut inner.yt_dlp).await;
+        }
+    }
+
+    fn terminate_now(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            inner.stderr_drain.abort();
+            drop(inner.yt_stdout);
+            terminate_child_now(inner.yt_dlp);
+        }
+    }
+}
+
+impl Drop for PreparedYtDlpStream {
+    fn drop(&mut self) {
+        self.terminate_now();
+    }
+}
+
+pub async fn prepare_yt_dlp_stream_with_command(
     program: &str,
     args: &[String],
     url: &YouTubeUrl,
     cancel: CancellationToken,
     timeout: Duration,
-) -> Result<TrackMetadata, VoiceBackendError> {
+) -> Result<ResolvedTrack<PreparedYtDlpStream>, VoiceBackendError> {
     if cancel.is_cancelled() {
         return Err(VoiceBackendError::Cancelled);
     }
@@ -207,90 +386,143 @@ pub async fn resolve_track_with_command(
     };
 
     let Some(stderr) = child.stderr.take() else {
+        drop(stdout);
         terminate_child(&mut child).await;
         return Err(VoiceBackendError::ResolveFailed(
             "yt-dlp stderr pipe was unavailable".to_string(),
         ));
     };
 
-    let stdout_task =
-        tokio::spawn(async move { read_stream_bounded(stdout, MAX_METADATA_OUTPUT_BYTES).await });
-    let stderr_task =
-        tokio::spawn(async move { read_stream_bounded(stderr, MAX_STDERR_OUTPUT_BYTES).await });
+    let mut stderr_reader = BufReader::new(stderr);
+    let mut stderr_diagnostics = Vec::new();
+    let deadline = tokio::time::Instant::now() + timeout;
 
-    enum WaitOutcome {
+    enum LineWaitOutcome {
+        Read(io::Result<BoundedLine>),
+        Cancelled,
+        TimedOut,
+    }
+
+    enum ExitWaitOutcome {
         Exited(io::Result<std::process::ExitStatus>),
         Cancelled,
         TimedOut,
     }
 
-    let outcome = tokio::select! {
-        status = child.wait() => WaitOutcome::Exited(status),
-        () = cancel.cancelled() => WaitOutcome::Cancelled,
-        () = tokio::time::sleep(timeout) => WaitOutcome::TimedOut,
-    };
+    loop {
+        let outcome = tokio::select! {
+            line = read_bounded_line(&mut stderr_reader, MAX_METADATA_OUTPUT_BYTES) => LineWaitOutcome::Read(line),
+            () = cancel.cancelled() => LineWaitOutcome::Cancelled,
+            () = tokio::time::sleep_until(deadline) => LineWaitOutcome::TimedOut,
+        };
 
-    match outcome {
-        WaitOutcome::Cancelled => {
-            terminate_child(&mut child).await;
-            stdout_task.abort();
-            stderr_task.abort();
-            Err(VoiceBackendError::Cancelled)
-        }
-        WaitOutcome::TimedOut => {
-            terminate_child(&mut child).await;
-            stdout_task.abort();
-            stderr_task.abort();
-            Err(VoiceBackendError::ResolveFailed(
-                "yt-dlp timed out while resolving YouTube metadata".to_string(),
-            ))
-        }
-        WaitOutcome::Exited(status_result) => {
-            let status = status_result.map_err(|error| {
-                stdout_task.abort();
-                stderr_task.abort();
-                VoiceBackendError::ResolveFailed(format!(
-                    "failed while waiting for yt-dlp: {error}"
-                ))
-            })?;
-
-            let stdout_bytes = stdout_task
-                .await
-                .map_err(|error| {
-                    VoiceBackendError::ResolveFailed(format!(
-                        "yt-dlp stdout reader failed: {error}"
-                    ))
-                })?
-                .map_err(|error| {
-                    VoiceBackendError::ResolveFailed(format!(
-                        "failed reading yt-dlp stdout: {error}"
-                    ))
-                })?;
-
-            let stderr_bytes = stderr_task
-                .await
-                .map_err(|error| {
-                    VoiceBackendError::ResolveFailed(format!(
-                        "yt-dlp stderr reader failed: {error}"
-                    ))
-                })?
-                .map_err(|error| {
-                    VoiceBackendError::ResolveFailed(format!(
-                        "failed reading yt-dlp stderr: {error}"
-                    ))
-                })?;
-
-            if cancel.is_cancelled() {
+        match outcome {
+            LineWaitOutcome::Cancelled => {
+                drop(stdout);
+                drop(stderr_reader);
+                terminate_child(&mut child).await;
                 return Err(VoiceBackendError::Cancelled);
             }
-
-            if !status.success() {
-                let detail = first_non_empty_line(&stderr_bytes)
-                    .unwrap_or_else(|| format!("exit status {status}"));
-                return Err(VoiceBackendError::ResolveFailed(detail));
+            LineWaitOutcome::TimedOut => {
+                drop(stdout);
+                drop(stderr_reader);
+                terminate_child(&mut child).await;
+                return Err(VoiceBackendError::ResolveFailed(
+                    "yt-dlp timed out while resolving YouTube metadata".to_string(),
+                ));
             }
+            LineWaitOutcome::Read(Err(error)) => {
+                drop(stdout);
+                drop(stderr_reader);
+                terminate_child(&mut child).await;
+                return Err(VoiceBackendError::ResolveFailed(format!(
+                    "failed reading yt-dlp stderr: {error}"
+                )));
+            }
+            LineWaitOutcome::Read(Ok(BoundedLine::TooLong)) => {
+                drop(stdout);
+                drop(stderr_reader);
+                terminate_child(&mut child).await;
+                return Err(VoiceBackendError::ResolveFailed(
+                    "yt-dlp metadata output exceeded maximum allowed size".to_string(),
+                ));
+            }
+            LineWaitOutcome::Read(Ok(BoundedLine::Line(raw_line))) => {
+                if let Some(parsed_result) = parse_yt_dlp_metadata_line(url, &raw_line) {
+                    let metadata = match parsed_result {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            drop(stdout);
+                            drop(stderr_reader);
+                            terminate_child(&mut child).await;
+                            return Err(error);
+                        }
+                    };
 
-            parse_yt_dlp_metadata(url, &stdout_bytes)
+                    if cancel.is_cancelled() {
+                        drop(stdout);
+                        drop(stderr_reader);
+                        terminate_child(&mut child).await;
+                        return Err(VoiceBackendError::Cancelled);
+                    }
+
+                    let stderr_drain = tokio::spawn(async move {
+                        drain_reader_to_eof(stderr_reader).await;
+                    });
+                    let prepared = PreparedYtDlpStream::new(child, stdout, stderr_drain);
+                    return Ok(ResolvedTrack::new(metadata, prepared));
+                }
+
+                append_bounded_diagnostic_line(
+                    &mut stderr_diagnostics,
+                    &raw_line,
+                    MAX_STDERR_OUTPUT_BYTES,
+                );
+            }
+            LineWaitOutcome::Read(Ok(BoundedLine::Eof)) => {
+                drop(stdout);
+                drop(stderr_reader);
+
+                let exit_outcome = tokio::select! {
+                    status = child.wait() => ExitWaitOutcome::Exited(status),
+                    () = cancel.cancelled() => ExitWaitOutcome::Cancelled,
+                    () = tokio::time::sleep_until(deadline) => ExitWaitOutcome::TimedOut,
+                };
+
+                match exit_outcome {
+                    ExitWaitOutcome::Cancelled => {
+                        terminate_child(&mut child).await;
+                        return Err(VoiceBackendError::Cancelled);
+                    }
+                    ExitWaitOutcome::TimedOut => {
+                        terminate_child(&mut child).await;
+                        return Err(VoiceBackendError::ResolveFailed(
+                            "yt-dlp timed out while resolving YouTube metadata".to_string(),
+                        ));
+                    }
+                    ExitWaitOutcome::Exited(status_result) => {
+                        let status = status_result.map_err(|error| {
+                            VoiceBackendError::ResolveFailed(format!(
+                                "failed while waiting for yt-dlp: {error}"
+                            ))
+                        })?;
+
+                        if cancel.is_cancelled() {
+                            return Err(VoiceBackendError::Cancelled);
+                        }
+
+                        if !status.success() {
+                            let detail = first_non_empty_line(&stderr_diagnostics)
+                                .unwrap_or_else(|| format!("exit status {status}"));
+                            return Err(VoiceBackendError::ResolveFailed(detail));
+                        }
+
+                        return Err(VoiceBackendError::ResolveFailed(
+                            "yt-dlp exited without emitting track metadata".to_string(),
+                        ));
+                    }
+                }
+            }
         }
     }
 }
@@ -298,6 +530,7 @@ pub async fn resolve_track_with_command(
 struct PipelineChildren {
     yt_dlp: Child,
     ffmpeg: Child,
+    stderr_drain: Option<JoinHandle<()>>,
 }
 
 pub struct PipelineController {
@@ -305,9 +538,13 @@ pub struct PipelineController {
 }
 
 impl PipelineController {
-    fn new(yt_dlp: Child, ffmpeg: Child) -> Arc<Self> {
+    fn new(yt_dlp: Child, ffmpeg: Child, stderr_drain: Option<JoinHandle<()>>) -> Arc<Self> {
         Arc::new(Self {
-            children: Mutex::new(Some(PipelineChildren { yt_dlp, ffmpeg })),
+            children: Mutex::new(Some(PipelineChildren {
+                yt_dlp,
+                ffmpeg,
+                stderr_drain,
+            })),
         })
     }
 
@@ -330,6 +567,9 @@ impl PipelineController {
     pub async fn terminate_async(&self) {
         let taken = self.lock_children().take();
         if let Some(mut children) = taken {
+            if let Some(drain) = children.stderr_drain.take() {
+                drain.abort();
+            }
             terminate_child(&mut children.ffmpeg).await;
             terminate_child(&mut children.yt_dlp).await;
         }
@@ -338,14 +578,11 @@ impl PipelineController {
     pub fn terminate_now(&self) {
         let taken = self.lock_children().take();
         if let Some(mut children) = taken {
-            let _ = children.ffmpeg.start_kill();
-            let _ = children.yt_dlp.start_kill();
-            if let Ok(handle) = Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = children.ffmpeg.wait().await;
-                    let _ = children.yt_dlp.wait().await;
-                });
+            if let Some(drain) = children.stderr_drain.take() {
+                drain.abort();
             }
+            terminate_child_now(children.ffmpeg);
+            terminate_child_now(children.yt_dlp);
         }
     }
 }
@@ -437,34 +674,22 @@ impl Drop for OwnedPipelineStream {
     }
 }
 
-pub async fn spawn_streaming_pipeline_with_commands(
-    yt_dlp_program: &str,
-    yt_dlp_args: &[String],
+pub async fn attach_ffmpeg_to_prepared_stream(
+    mut prepared: PreparedYtDlpStream,
     ffmpeg_program: &str,
     ffmpeg_args: &[String],
 ) -> Result<(Input, Arc<PipelineController>), VoiceBackendError> {
-    let mut yt_dlp = Command::new(yt_dlp_program)
-        .args(yt_dlp_args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| {
-            VoiceBackendError::PlaybackFailed(format!("failed to start yt-dlp stream: {error}"))
-        })?;
-
-    let Some(yt_stdout) = yt_dlp.stdout.take() else {
-        terminate_child(&mut yt_dlp).await;
+    let Some(mut inner) = prepared.inner.take() else {
         return Err(VoiceBackendError::PlaybackFailed(
-            "yt-dlp stdout pipe was unavailable".to_string(),
+            "prepared yt-dlp stream was already consumed or terminated".to_string(),
         ));
     };
 
-    let yt_stdout_stdio: Stdio = match yt_stdout.try_into() {
+    let yt_stdout_stdio: Stdio = match inner.yt_stdout.try_into() {
         Ok(stdio) => stdio,
         Err(error) => {
-            terminate_child(&mut yt_dlp).await;
+            inner.stderr_drain.abort();
+            terminate_child(&mut inner.yt_dlp).await;
             return Err(VoiceBackendError::PlaybackFailed(format!(
                 "failed to attach yt-dlp stdout to ffmpeg stdin: {error}"
             )));
@@ -481,7 +706,8 @@ pub async fn spawn_streaming_pipeline_with_commands(
     {
         Ok(child) => child,
         Err(error) => {
-            terminate_child(&mut yt_dlp).await;
+            inner.stderr_drain.abort();
+            terminate_child(&mut inner.yt_dlp).await;
             return Err(VoiceBackendError::PlaybackFailed(format!(
                 "failed to start ffmpeg transcoder: {error}"
             )));
@@ -489,14 +715,15 @@ pub async fn spawn_streaming_pipeline_with_commands(
     };
 
     let Some(ffmpeg_stdout) = ffmpeg.stdout.take() else {
+        inner.stderr_drain.abort();
         terminate_child(&mut ffmpeg).await;
-        terminate_child(&mut yt_dlp).await;
+        terminate_child(&mut inner.yt_dlp).await;
         return Err(VoiceBackendError::PlaybackFailed(
             "ffmpeg stdout pipe was unavailable".to_string(),
         ));
     };
 
-    let controller = PipelineController::new(yt_dlp, ffmpeg);
+    let controller = PipelineController::new(inner.yt_dlp, ffmpeg, Some(inner.stderr_drain));
     let media_source = ManagedPipeMediaSource {
         reader: ffmpeg_stdout,
         controller: Arc::clone(&controller),
@@ -608,13 +835,16 @@ impl Drop for SongbirdVoiceBackend {
 }
 
 impl VoiceBackend for SongbirdVoiceBackend {
+    type PreparedStream = PreparedYtDlpStream;
+
     async fn resolve_track(
         &self,
         url: &YouTubeUrl,
         cancel: CancellationToken,
-    ) -> Result<TrackMetadata, VoiceBackendError> {
-        let args = build_yt_dlp_metadata_args(url);
-        resolve_track_with_command(&self.yt_dlp_path, &args, url, cancel, RESOLVE_TIMEOUT).await
+    ) -> Result<ResolvedTrack<Self::PreparedStream>, VoiceBackendError> {
+        let args = build_yt_dlp_stream_args(url);
+        prepare_yt_dlp_stream_with_command(&self.yt_dlp_path, &args, url, cancel, RESOLVE_TIMEOUT)
+            .await
     }
 
     async fn join(
@@ -692,34 +922,40 @@ impl VoiceBackend for SongbirdVoiceBackend {
     async fn play(
         &self,
         target: VoiceTarget,
-        track: &TrackMetadata,
+        track: ResolvedTrack<Self::PreparedStream>,
         generation: PlaybackGeneration,
         cancel: CancellationToken,
     ) -> Result<(), VoiceBackendError> {
+        let prepared = track.prepared;
         if cancel.is_cancelled() {
+            prepared.terminate_async().await;
             return Err(VoiceBackendError::Cancelled);
         }
 
-        let sg_guild = to_songbird_guild_id(target.guild_id)
-            .ok_or_else(|| VoiceBackendError::PlaybackFailed("invalid guild ID".to_string()))?;
+        let Some(sg_guild) = to_songbird_guild_id(target.guild_id) else {
+            prepared.terminate_async().await;
+            return Err(VoiceBackendError::PlaybackFailed(
+                "invalid guild ID".to_string(),
+            ));
+        };
 
         self.stop_guild_playback(target.guild_id).await;
 
-        let call = self.songbird.get(sg_guild).ok_or_else(|| {
-            VoiceBackendError::PlaybackFailed(
-                "bot is not connected to a Discord voice channel".to_string(),
-            )
-        })?;
+        if cancel.is_cancelled() {
+            prepared.terminate_async().await;
+            return Err(VoiceBackendError::Cancelled);
+        }
 
-        let yt_args = build_yt_dlp_stream_args(&track.url);
+        let Some(call) = self.songbird.get(sg_guild) else {
+            prepared.terminate_async().await;
+            return Err(VoiceBackendError::PlaybackFailed(
+                "bot is not connected to a Discord voice channel".to_string(),
+            ));
+        };
+
         let ffmpeg_args = build_ffmpeg_pcm_args();
-        let (input, controller) = spawn_streaming_pipeline_with_commands(
-            &self.yt_dlp_path,
-            &yt_args,
-            &self.ffmpeg_path,
-            &ffmpeg_args,
-        )
-        .await?;
+        let (input, controller) =
+            attach_ffmpeg_to_prepared_stream(prepared, &self.ffmpeg_path, &ffmpeg_args).await?;
 
         if cancel.is_cancelled() {
             controller.terminate_async().await;
@@ -728,6 +964,11 @@ impl VoiceBackend for SongbirdVoiceBackend {
 
         let track_handle = {
             let mut handler = call.lock().await;
+            if cancel.is_cancelled() {
+                drop(handler);
+                controller.terminate_async().await;
+                return Err(VoiceBackendError::Cancelled);
+            }
             handler.play_only_input(input)
         };
 
@@ -757,6 +998,10 @@ impl VoiceBackend for SongbirdVoiceBackend {
         }
 
         Ok(())
+    }
+
+    async fn discard_prepared(&self, prepared: Self::PreparedStream) {
+        prepared.terminate_async().await;
     }
 
     async fn stop(&self, guild_id: GuildId) -> Result<(), VoiceBackendError> {
@@ -882,9 +1127,10 @@ mod tests {
     use songbird::input::{Input, RawAdapter};
 
     use super::{
-        DISCORD_CHANNELS, DISCORD_SAMPLE_RATE, build_ffmpeg_pcm_args, build_songbird_config,
-        build_yt_dlp_metadata_args, build_yt_dlp_stream_args, parse_yt_dlp_metadata,
-        resolve_track_with_command, spawn_streaming_pipeline_with_commands,
+        DISCORD_CHANNELS, DISCORD_SAMPLE_RATE, YT_DLP_METADATA_PREFIX,
+        YT_DLP_METADATA_PRINT_TEMPLATE, attach_ffmpeg_to_prepared_stream, build_ffmpeg_pcm_args,
+        build_songbird_config, build_yt_dlp_stream_args, parse_yt_dlp_metadata,
+        parse_yt_dlp_metadata_line, prepare_yt_dlp_stream_with_command,
     };
     use crate::core::{CancellationToken, VoiceBackendError};
     use crate::youtube::YouTubeUrl;
@@ -896,19 +1142,22 @@ mod tests {
     }
 
     #[test]
-    fn argument_builders_use_safe_argument_arrays_without_disk_downloads() {
+    fn argument_builders_use_safe_single_invocation_args_without_disk_downloads() {
         let url = YouTubeUrl::parse("https://youtu.be/dQw4w9WgXcQ").unwrap();
 
-        let meta_args = build_yt_dlp_metadata_args(&url);
-        assert!(meta_args.contains(&"--no-playlist".to_string()));
-        assert!(meta_args.contains(&"--skip-download".to_string()));
-        assert!(meta_args.contains(&"--dump-single-json".to_string()));
-        assert_eq!(meta_args[meta_args.len() - 2], "--");
-        assert_eq!(meta_args[meta_args.len() - 1], url.as_str());
-
         let stream_args = build_yt_dlp_stream_args(&url);
+        assert!(stream_args.contains(&"--no-playlist".to_string()));
+        assert!(stream_args.contains(&"--no-warnings".to_string()));
         assert!(stream_args.contains(&"--no-part".to_string()));
         assert!(stream_args.contains(&"--no-cache-dir".to_string()));
+        assert!(stream_args.contains(&"--no-progress".to_string()));
+        assert!(stream_args.contains(&"--no-simulate".to_string()));
+        assert!(!stream_args.contains(&"--skip-download".to_string()));
+        assert!(
+            stream_args
+                .windows(2)
+                .any(|pair| pair == ["--print", YT_DLP_METADATA_PRINT_TEMPLATE])
+        );
         assert!(stream_args.windows(2).any(|pair| pair == ["-o", "-"]));
         assert_eq!(stream_args[stream_args.len() - 2], "--");
         assert_eq!(stream_args[stream_args.len() - 1], url.as_str());
@@ -940,6 +1189,30 @@ mod tests {
 
         let invalid = parse_yt_dlp_metadata(&url, b"not-json").unwrap_err();
         assert!(matches!(invalid, VoiceBackendError::ResolveFailed(_)));
+    }
+
+    #[test]
+    fn parses_prefixed_metadata_line_and_ignores_unrelated_stderr_lines() {
+        let url = YouTubeUrl::parse("https://youtu.be/dQw4w9WgXcQ").unwrap();
+
+        assert!(parse_yt_dlp_metadata_line(&url, b"[youtube] Extracting URL\r\n").is_none());
+        assert!(parse_yt_dlp_metadata_line(&url, b"ERROR: temporary glitch\n").is_none());
+
+        let valid_line = format!(
+            "{YT_DLP_METADATA_PREFIX}{{\"title\":\"Demo Track\",\"channel\":\"Demo Channel\",\"uploader\":\"Fallback\",\"duration\":42}}\r\n"
+        );
+        let metadata = parse_yt_dlp_metadata_line(&url, valid_line.as_bytes())
+            .expect("prefixed line should match")
+            .unwrap();
+        assert_eq!(metadata.title.as_deref(), Some("Demo Track"));
+        assert_eq!(metadata.channel.as_deref(), Some("Demo Channel"));
+        assert_eq!(metadata.duration_seconds, Some(42));
+
+        let malformed_line = format!("{YT_DLP_METADATA_PREFIX}{{not-json}}\n");
+        let error = parse_yt_dlp_metadata_line(&url, malformed_line.as_bytes())
+            .expect("prefixed malformed line should be parsed")
+            .unwrap_err();
+        assert!(matches!(error, VoiceBackendError::ResolveFailed(_)));
     }
 
     #[tokio::test]
@@ -984,54 +1257,125 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[tokio::test]
-    async fn streaming_pipeline_explicit_termination_leaves_no_orphaned_processes() {
-        let sleep_args = vec![
+    fn powershell_command_args(script: &str) -> Vec<String> {
+        vec![
+            "-NoLogo".to_string(),
             "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
             "-Command".to_string(),
-            "Start-Sleep -Seconds 30".to_string(),
-        ];
+            script.to_string(),
+        ]
+    }
 
-        let (input, controller) = spawn_streaming_pipeline_with_commands(
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn single_prepared_stream_yields_metadata_and_attaches_to_ffmpeg_cleanly() {
+        let url = YouTubeUrl::parse("https://youtu.be/dQw4w9WgXcQ").unwrap();
+        let upstream_args = powershell_command_args(
+            "[Console]::Error.WriteLine('diagnostic noise before metadata'); \
+             [Console]::Error.WriteLine('ZEBOT_META:{\"title\":\"Single Pass Song\",\"channel\":\"Zebot Channel\",\"uploader\":\"Fallback\",\"duration\":95}'); \
+             [Console]::Error.Flush(); \
+             Start-Sleep -Seconds 30",
+        );
+        let downstream_args = powershell_command_args("Start-Sleep -Seconds 30");
+
+        let resolved = prepare_yt_dlp_stream_with_command(
             "powershell",
-            &sleep_args,
-            "powershell",
-            &sleep_args,
+            &upstream_args,
+            &url,
+            CancellationToken::new(),
+            Duration::from_secs(10),
         )
         .await
         .unwrap();
 
+        assert_eq!(resolved.metadata.title.as_deref(), Some("Single Pass Song"));
+        assert_eq!(resolved.metadata.channel.as_deref(), Some("Zebot Channel"));
+        assert_eq!(resolved.metadata.duration_seconds, Some(95));
+        assert!(resolved.prepared.is_active());
+
+        let original_yt_pid = resolved
+            .prepared
+            .yt_dlp_pid()
+            .expect("prepared stream should expose upstream PID");
+        assert!(is_windows_pid_alive(original_yt_pid));
+
+        let (input, controller) =
+            attach_ffmpeg_to_prepared_stream(resolved.prepared, "powershell", &downstream_args)
+                .await
+                .unwrap();
+
         let (yt_pid, ff_pid) = controller.child_pids();
-        let yt_pid = yt_pid.expect("upstream child pid");
+        assert_eq!(yt_pid, Some(original_yt_pid));
         let ff_pid = ff_pid.expect("downstream child pid");
-        assert!(is_windows_pid_alive(yt_pid));
+        assert!(is_windows_pid_alive(original_yt_pid));
         assert!(is_windows_pid_alive(ff_pid));
 
         controller.terminate_async().await;
         drop(input);
 
         assert!(!controller.is_active());
-        assert!(!is_windows_pid_alive(yt_pid));
+        assert!(!is_windows_pid_alive(original_yt_pid));
         assert!(!is_windows_pid_alive(ff_pid));
     }
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn dropping_pipeline_kills_child_processes_without_explicit_stop() {
-        let sleep_args = vec![
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            "Start-Sleep -Seconds 30".to_string(),
-        ];
+    async fn dropping_prepared_stream_kills_upstream_process_without_attaching_ffmpeg() {
+        let url = YouTubeUrl::parse("https://youtu.be/dQw4w9WgXcQ").unwrap();
+        let upstream_args = powershell_command_args(
+            "[Console]::Error.WriteLine('ZEBOT_META:{\"title\":\"Aborted Track\",\"channel\":\"Chan\",\"duration\":12}'); \
+             [Console]::Error.Flush(); \
+             Start-Sleep -Seconds 30",
+        );
 
-        let (input, controller) = spawn_streaming_pipeline_with_commands(
+        let resolved = prepare_yt_dlp_stream_with_command(
             "powershell",
-            &sleep_args,
-            "powershell",
-            &sleep_args,
+            &upstream_args,
+            &url,
+            CancellationToken::new(),
+            Duration::from_secs(10),
         )
         .await
         .unwrap();
+
+        let yt_pid = resolved
+            .prepared
+            .yt_dlp_pid()
+            .expect("prepared stream should expose upstream PID");
+        assert!(is_windows_pid_alive(yt_pid));
+
+        drop(resolved);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!is_windows_pid_alive(yt_pid));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn dropping_attached_pipeline_kills_both_processes_without_explicit_stop() {
+        let url = YouTubeUrl::parse("https://youtu.be/dQw4w9WgXcQ").unwrap();
+        let upstream_args = powershell_command_args(
+            "[Console]::Error.WriteLine('ZEBOT_META:{\"title\":\"Drop Test\",\"channel\":\"Chan\",\"duration\":30}'); \
+             [Console]::Error.Flush(); \
+             Start-Sleep -Seconds 30",
+        );
+        let downstream_args = powershell_command_args("Start-Sleep -Seconds 30");
+
+        let resolved = prepare_yt_dlp_stream_with_command(
+            "powershell",
+            &upstream_args,
+            &url,
+            CancellationToken::new(),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+
+        let (input, controller) =
+            attach_ffmpeg_to_prepared_stream(resolved.prepared, "powershell", &downstream_args)
+                .await
+                .unwrap();
 
         let (yt_pid, ff_pid) = controller.child_pids();
         let yt_pid = yt_pid.expect("upstream child pid");
@@ -1042,35 +1386,252 @@ mod tests {
         drop(input);
         drop(controller);
 
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(!is_windows_pid_alive(yt_pid));
         assert!(!is_windows_pid_alive(ff_pid));
     }
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn cancelling_metadata_resolution_kills_child_process_immediately() {
+    async fn cancelling_stream_preparation_kills_process_tree_immediately() {
         let url = YouTubeUrl::parse("https://youtu.be/dQw4w9WgXcQ").unwrap();
         let cancel = CancellationToken::new();
         let cancel_trigger = cancel.clone();
 
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(150)).await;
+        let pid_file = std::path::PathBuf::from("temp")
+            .join(format!("zebot-grandchild-pid-{}.txt", std::process::id()));
+        let _ = std::fs::create_dir_all("temp");
+        let _ = std::fs::remove_file(&pid_file);
+
+        let watcher_pid_file = pid_file.clone();
+        let watcher_task = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+            let mut found_pid = None;
+            while tokio::time::Instant::now() < deadline {
+                if let Ok(raw) = std::fs::read_to_string(&watcher_pid_file)
+                    && let Ok(parsed) = raw.trim().parse::<u32>()
+                {
+                    found_pid = Some(parsed);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             cancel_trigger.cancel();
+            found_pid
         });
 
-        let args = vec![
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            "Start-Sleep -Seconds 30".to_string(),
-        ];
+        let script = format!(
+            "$child = Start-Process -FilePath 'powershell' -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -WindowStyle Hidden -PassThru; \
+             [System.IO.File]::WriteAllText('{}', [string]$child.Id); \
+             Start-Sleep -Seconds 30",
+            pid_file.display()
+        );
+        let args = powershell_command_args(&script);
 
         let started = tokio::time::Instant::now();
-        let result =
-            resolve_track_with_command("powershell", &args, &url, cancel, Duration::from_secs(10))
-                .await;
+        let result = prepare_yt_dlp_stream_with_command(
+            "powershell",
+            &args,
+            &url,
+            cancel,
+            Duration::from_secs(10),
+        )
+        .await;
 
-        assert_eq!(result, Err(VoiceBackendError::Cancelled));
+        assert!(matches!(result, Err(VoiceBackendError::Cancelled)));
+        assert!(started.elapsed() < Duration::from_secs(9));
+
+        let grandchild_pid = watcher_task
+            .await
+            .expect("watcher task should complete")
+            .expect("grandchild process should have written its PID before cancellation");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!is_windows_pid_alive(grandchild_pid));
+        let _ = std::fs::remove_file(&pid_file);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attached_pipeline_streams_upstream_stdout_bytes_into_playable_songbird_input() {
+        let url = YouTubeUrl::parse("https://youtu.be/dQw4w9WgXcQ").unwrap();
+        let frame_bytes = (DISCORD_SAMPLE_RATE as usize / 50)
+            * DISCORD_CHANNELS as usize
+            * std::mem::size_of::<f32>();
+
+        let upstream_script = format!(
+            "[Console]::Error.WriteLine('ZEBOT_META:{{\"title\":\"Pipe Audio\",\"channel\":\"Pipe Channel\",\"duration\":1}}'); \
+             [Console]::Error.Flush(); \
+             $bytes = New-Object byte[] {frame_bytes}; \
+             $stdout = [Console]::OpenStandardOutput(); \
+             $stdout.Write($bytes, 0, $bytes.Length); \
+             $stdout.Flush()"
+        );
+        let downstream_script = concat!(
+            "$stdin = [Console]::OpenStandardInput(); ",
+            "$stdout = [Console]::OpenStandardOutput(); ",
+            "$stdin.CopyTo($stdout); ",
+            "$stdout.Flush()"
+        );
+        let downstream_args = vec![
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-InputFormat".to_string(),
+            "None".to_string(),
+            "-Command".to_string(),
+            downstream_script.to_string(),
+        ];
+
+        let resolved = prepare_yt_dlp_stream_with_command(
+            "powershell",
+            &powershell_command_args(&upstream_script),
+            &url,
+            CancellationToken::new(),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.metadata.title.as_deref(), Some("Pipe Audio"));
+        assert_eq!(resolved.metadata.channel.as_deref(), Some("Pipe Channel"));
+        assert_eq!(resolved.metadata.duration_seconds, Some(1));
+
+        let (input, controller) =
+            attach_ffmpeg_to_prepared_stream(resolved.prepared, "powershell", &downstream_args)
+                .await
+                .unwrap();
+
+        let mut playable = tokio::time::timeout(
+            Duration::from_secs(10),
+            input.make_playable_async(get_codec_registry(), get_probe()),
+        )
+        .await
+        .expect("make_playable_async should not time out")
+        .expect("attached pipeline PCM output should be playable");
+        assert!(playable.is_playable());
+
+        let decoded_frames = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || {
+                let parsed = playable
+                    .parsed_mut()
+                    .expect("playable input should expose parsed format and decoder");
+                let packet = parsed
+                    .format
+                    .next_packet()
+                    .expect("attached pipeline should yield a 20ms PCM packet");
+                let decoded = parsed
+                    .decoder
+                    .decode(&packet)
+                    .expect("Symphonia PCM decoder should decode piped PCM packet");
+                decoded.frames()
+            }),
+        )
+        .await
+        .expect("decoding piped PCM packet should not time out")
+        .expect("blocking decode task should succeed");
+        assert_eq!(decoded_frames, DISCORD_SAMPLE_RATE as usize / 50);
+
+        controller.terminate_async().await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn stream_preparation_reports_stderr_error_when_process_fails_before_metadata() {
+        let url = YouTubeUrl::parse("https://youtu.be/dQw4w9WgXcQ").unwrap();
+        let args = powershell_command_args(
+            "[Console]::Error.WriteLine('ERROR: [youtube] dQw4w9WgXcQ: Video unavailable'); exit 1",
+        );
+
+        let error = match prepare_yt_dlp_stream_with_command(
+            "powershell",
+            &args,
+            &url,
+            CancellationToken::new(),
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            Ok(_) => unreachable!("failing command must not succeed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            VoiceBackendError::ResolveFailed(
+                "ERROR: [youtube] dQw4w9WgXcQ: Video unavailable".to_string()
+            )
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn stream_preparation_rejects_clean_exit_without_metadata_and_malformed_json() {
+        let url = YouTubeUrl::parse("https://youtu.be/dQw4w9WgXcQ").unwrap();
+
+        let no_meta_error = match prepare_yt_dlp_stream_with_command(
+            "powershell",
+            &powershell_command_args("exit 0"),
+            &url,
+            CancellationToken::new(),
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            Ok(_) => unreachable!("clean exit without metadata must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            no_meta_error,
+            VoiceBackendError::ResolveFailed(
+                "yt-dlp exited without emitting track metadata".to_string()
+            )
+        );
+
+        let bad_json_args = powershell_command_args(
+            "[Console]::Error.WriteLine('ZEBOT_META:not-json'); [Console]::Error.Flush(); Start-Sleep -Seconds 30",
+        );
+        let started = tokio::time::Instant::now();
+        let bad_json_error = match prepare_yt_dlp_stream_with_command(
+            "powershell",
+            &bad_json_args,
+            &url,
+            CancellationToken::new(),
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            Ok(_) => unreachable!("malformed metadata JSON must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            bad_json_error,
+            VoiceBackendError::ResolveFailed(_)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn stream_preparation_times_out_and_kills_hanging_process() {
+        let url = YouTubeUrl::parse("https://youtu.be/dQw4w9WgXcQ").unwrap();
+        let args = powershell_command_args("Start-Sleep -Seconds 30");
+
+        let started = tokio::time::Instant::now();
+        let error = match prepare_yt_dlp_stream_with_command(
+            "powershell",
+            &args,
+            &url,
+            CancellationToken::new(),
+            Duration::from_millis(300),
+        )
+        .await
+        {
+            Ok(_) => unreachable!("hanging command must time out"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, VoiceBackendError::ResolveFailed(_)));
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
