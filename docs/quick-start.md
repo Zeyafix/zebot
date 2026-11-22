@@ -82,7 +82,50 @@ Generate a random `API_TOKEN` in PowerShell:
 
 Never commit `.env` (it is ignored by `.gitignore`).
 
-## 5. Standard Verification Commands
+## 5. Starting, Checking, and Stopping Zebot on Windows (`launch.bat`)
+
+Use `launch.bat` in the repository root to manage Zebot without keeping a manual `cargo run` terminal open. The launcher resolves the repository root from its own location, so it works when double-clicked from Windows Explorer or called from any working directory.
+
+### Interactive Usage (Windows Explorer)
+
+Double-click `launch.bat` (or run it with no arguments):
+
+- When Zebot is **stopped**, `launch.bat` builds the binary if needed, starts Zebot, streams its live output in the console window, and keeps the window open. Press `Enter` or close the console window (`X`) to stop Zebot and its child processes cleanly. If startup fails, the window stays open until you press `Enter` so you can read the error.
+- When Zebot is **already running** (for example, started in the background via `launch.bat start`), `launch.bat` shows its PID and prompts whether to stop it (`Y/n`, default `Y`).
+
+### Non-Interactive CLI Usage (Terminal and AI Agents)
+
+Both human hosts and AI agents operate Zebot through the same non-interactive commands (they never block on `pause`):
+
+```powershell
+.\launch.bat start
+.\launch.bat status
+.\launch.bat stop
+.\launch.bat help
+```
+
+Behavior and guarantees:
+
+- **`start`:** Checks for `.env` (unless `DISCORD_TOKEN` is provided in the environment), builds an up-to-date `target\debug\zebot.exe` with `cargo build --bin zebot`, launches a single background Zebot instance, and verifies startup preflight checks (`.env`, `yt-dlp`, and `ffmpeg`). Calling `start` when Zebot is already running is safe and idempotent.
+- **`status`:** Validates the tracked PID against the live Windows process table (`ExecutablePath` and process start time), removes any stale PID file automatically, and reports whether Zebot is running or stopped.
+- **`stop`:** Terminates Zebot and its child process tree cleanly so no orphaned `zebot`, `yt-dlp`, or `ffmpeg` processes remain, and removes the PID file. Calling `stop` when Zebot is already stopped is safe and idempotent.
+
+Exit codes:
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Success (or Zebot is running for `status`) |
+| `1` | Runtime or prerequisite error (missing `.env`, missing Rust toolchain, build failure, failed `yt-dlp`/`ffmpeg` preflight, or failed stop) |
+| `2` | Invalid command-line arguments |
+| `3` | Zebot is stopped (`status` only) |
+
+Runtime state and logs are stored strictly under `temp\launcher\` (ignored by Git):
+
+- `temp\launcher\zebot.pid` — tracked PID and process metadata for the live Zebot instance
+- `temp\launcher\zebot.stdout.log` — standard output from the latest run
+- `temp\launcher\zebot.stderr.log` — standard error from the latest run
+
+## 6. Standard Verification Commands
 
 Run the full check suite before opening a PR:
 
@@ -93,13 +136,13 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-To start Zebot locally (runs `.env` and external tool preflight checks, connects to Discord, registers `/status`, `/play`, `/stop`, and `/leave` in `DISCORD_GUILD_ID`, and shuts down cleanly on `Ctrl+C`):
+To run Zebot directly in the foreground during development (runs `.env` and external tool preflight checks, connects to Discord, registers `/status`, `/play`, `/stop`, and `/leave` in `DISCORD_GUILD_ID`, and shuts down cleanly on `Ctrl+C`):
 
 ```powershell
 cargo run
 ```
 
-## 6. Code Guardrails
+## 7. Code Guardrails
 
 Zebot enforces strict compile-time and lint-time guardrails for both human developers and AI agents:
 
