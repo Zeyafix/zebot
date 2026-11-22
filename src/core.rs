@@ -126,6 +126,22 @@ impl From<YouTubeUrlError> for CoreError {
     }
 }
 
+pub trait VoiceLifecycleListener: Send + Sync {
+    fn on_track_ended(&self, generation: PlaybackGeneration);
+
+    fn on_voice_disconnected(&self, guild_id: GuildId);
+}
+
+impl<B: Send + Sync> VoiceLifecycleListener for AppCore<B> {
+    fn on_track_ended(&self, generation: PlaybackGeneration) {
+        self.notify_track_ended(generation);
+    }
+
+    fn on_voice_disconnected(&self, guild_id: GuildId) {
+        self.notify_voice_disconnected(guild_id);
+    }
+}
+
 pub trait VoiceBackend: Send + Sync {
     fn resolve_track(
         &self,
@@ -336,6 +352,13 @@ impl<B> AppCore<B> {
             state.playback_state = PlaybackState::Idle;
             state.active_track = None;
             state.backend_playing = false;
+        }
+    }
+
+    pub fn notify_voice_channel_moved(&self, target: VoiceTarget) {
+        let mut state = self.lock_state();
+        if state.voice_target.map(|current| current.guild_id) == Some(target.guild_id) {
+            state.voice_target = Some(target);
         }
     }
 
@@ -1352,6 +1375,39 @@ mod tests {
         core.notify_voice_disconnected(guild_id);
         assert!(!core.status().is_connected_to_voice());
         assert_eq!(core.status().playback_state, PlaybackState::Idle);
+    }
+
+    #[tokio::test]
+    async fn voice_channel_move_updates_only_matching_connected_guild() {
+        let backend = MockVoiceBackend::new();
+        let core = AppCore::new(Arc::clone(&backend));
+        let guild_id = guild(12);
+        let original_channel = channel(120);
+        let moved_channel = channel(121);
+
+        core.notify_voice_channel_moved(VoiceTarget::new(guild_id, moved_channel));
+        assert_eq!(core.status().voice_target, None);
+
+        let _ = core
+            .play(PlayRequest::new(
+                guild_id,
+                original_channel,
+                "https://www.youtube.com/watch?v=moveTrack01",
+            ))
+            .await
+            .unwrap();
+
+        core.notify_voice_channel_moved(VoiceTarget::new(guild(999), moved_channel));
+        assert_eq!(
+            core.status().voice_target,
+            Some(VoiceTarget::new(guild_id, original_channel))
+        );
+
+        core.notify_voice_channel_moved(VoiceTarget::new(guild_id, moved_channel));
+        assert_eq!(
+            core.status().voice_target,
+            Some(VoiceTarget::new(guild_id, moved_channel))
+        );
     }
 
     #[tokio::test]

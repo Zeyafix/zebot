@@ -1,28 +1,54 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::num::NonZeroU64;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serenity::async_trait;
 use serenity::builder::{
-    CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage,
+    CreateCommand, CreateCommandOption, CreateInteractionResponse,
+    CreateInteractionResponseMessage, EditInteractionResponse,
 };
 use serenity::client::{Client, Context, EventHandler};
 use serenity::gateway::{ConnectionStage, ShardStageUpdateEvent};
-use serenity::model::application::Interaction;
+use serenity::model::application::{
+    CommandInteraction, CommandOptionType, Interaction, ResolvedValue,
+};
 use serenity::model::event::ResumedEvent;
 use serenity::model::gateway::{GatewayIntents, Ready};
-use serenity::model::id::GuildId as SerenityGuildId;
+use serenity::model::guild::Guild;
+use serenity::model::id::{ChannelId as SerenityChannelId, GuildId as SerenityGuildId};
+use serenity::model::permissions::Permissions;
+use serenity::model::voice::VoiceState;
+use songbird::{SerenityInit, Songbird};
 
 use crate::config::Config;
-use crate::core::{AppCore, VoiceBackend};
-use crate::state::{BotStatus, DiscordConnectionState, PlaybackState, TrackMetadata};
+use crate::core::{AppCore, CoreError, VoiceBackend};
+use crate::state::{
+    BotStatus, DiscordConnectionState, GuildId, PlayRequest, PlaybackState, TrackMetadata,
+    VoiceChannelId, VoiceTarget,
+};
+use crate::youtube::YouTubeUrl;
 
 pub const STATUS_COMMAND_NAME: &str = "status";
 pub const STATUS_COMMAND_DESCRIPTION: &str =
     "Show Zebot readiness, active voice channel, and playback state";
+
+pub const PLAY_COMMAND_NAME: &str = "play";
+pub const PLAY_COMMAND_DESCRIPTION: &str =
+    "Stream audio from a YouTube URL into your current voice channel";
+pub const PLAY_URL_OPTION_NAME: &str = "url";
+pub const PLAY_URL_OPTION_DESCRIPTION: &str = "YouTube video URL to play";
+
+pub const STOP_COMMAND_NAME: &str = "stop";
+pub const STOP_COMMAND_DESCRIPTION: &str =
+    "Stop current audio playback while remaining in the voice channel";
+
+pub const LEAVE_COMMAND_NAME: &str = "leave";
+pub const LEAVE_COMMAND_DESCRIPTION: &str =
+    "Stop audio playback and disconnect from the voice channel";
 
 #[derive(Debug)]
 pub enum DiscordError {
@@ -79,6 +105,10 @@ impl CommandScope {
         SerenityGuildId::from(self.guild_id)
     }
 
+    pub fn core_guild_id(self) -> Option<GuildId> {
+        GuildId::new(self.guild_id.get())
+    }
+
     pub fn guild_id_raw(self) -> u64 {
         self.guild_id.get()
     }
@@ -131,12 +161,142 @@ impl CommandReply {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingVoicePermissions {
+    pub connect: bool,
+    pub speak: bool,
+}
+
+impl MissingVoicePermissions {
+    pub fn describe(self) -> &'static str {
+        match (self.connect, self.speak) {
+            (true, true) => "Connect and Speak",
+            (true, false) => "Connect",
+            (false, true) => "Speak",
+            (false, false) => "none",
+        }
+    }
+}
+
+pub fn check_voice_permissions(permissions: Permissions) -> Result<(), MissingVoicePermissions> {
+    let missing_connect = !permissions.connect();
+    let missing_speak = !permissions.speak();
+
+    if missing_connect || missing_speak {
+        Err(MissingVoicePermissions {
+            connect: missing_connect,
+            speak: missing_speak,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayCommandContext {
+    pub invoking_voice_channel_id: Option<u64>,
+    pub bot_permissions: Option<Permissions>,
+}
+
+pub fn validate_play_preflight(
+    url: &str,
+    context: PlayCommandContext,
+) -> Result<(VoiceChannelId, YouTubeUrl), CommandReply> {
+    let Some(raw_channel_id) = context.invoking_voice_channel_id else {
+        return Err(CommandReply::ephemeral(
+            "You need to join a voice channel before using `/play`. Join a voice channel in this server and run `/play <youtube-url>` again.",
+        ));
+    };
+
+    let Some(voice_channel_id) = VoiceChannelId::new(raw_channel_id) else {
+        return Err(CommandReply::ephemeral(
+            "Unable to resolve your voice channel. Rejoin the voice channel and try `/play` again.",
+        ));
+    };
+
+    if let Some(permissions) = context.bot_permissions
+        && let Err(missing) = check_voice_permissions(permissions)
+    {
+        return Err(CommandReply::ephemeral(format!(
+            "Zebot is missing the required {} permission(s) in <#{}>. Grant Connect and Speak permissions for that voice channel and retry.",
+            missing.describe(),
+            voice_channel_id
+        )));
+    }
+
+    let validated_url = YouTubeUrl::parse(url).map_err(|error| {
+        CommandReply::ephemeral(format!(
+            "Invalid YouTube URL: {error}. Provide an `https://` YouTube video link (for example `https://www.youtube.com/watch?v=...` or `https://youtu.be/...`)."
+        ))
+    })?;
+
+    Ok((voice_channel_id, validated_url))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceChannelMember {
+    pub user_id: u64,
+    pub is_bot: bool,
+}
+
+pub fn count_non_bot_members(members: &[VoiceChannelMember], bot_user_id: u64) -> usize {
+    members
+        .iter()
+        .filter(|member| member.user_id != bot_user_id && !member.is_bot)
+        .count()
+}
+
+pub fn should_auto_leave_voice_channel(
+    status: &BotStatus,
+    guild_id: GuildId,
+    members: &[VoiceChannelMember],
+    bot_user_id: u64,
+) -> bool {
+    let Some(target) = status.voice_target else {
+        return false;
+    };
+
+    if target.guild_id != guild_id {
+        return false;
+    }
+
+    count_non_bot_members(members, bot_user_id) == 0
+}
+
 pub fn required_gateway_intents() -> GatewayIntents {
     GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES
 }
 
 pub fn build_slash_commands() -> Vec<CreateCommand> {
-    vec![CreateCommand::new(STATUS_COMMAND_NAME).description(STATUS_COMMAND_DESCRIPTION)]
+    vec![
+        CreateCommand::new(STATUS_COMMAND_NAME).description(STATUS_COMMAND_DESCRIPTION),
+        CreateCommand::new(PLAY_COMMAND_NAME)
+            .description(PLAY_COMMAND_DESCRIPTION)
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    PLAY_URL_OPTION_NAME,
+                    PLAY_URL_OPTION_DESCRIPTION,
+                )
+                .required(true),
+            ),
+        CreateCommand::new(STOP_COMMAND_NAME).description(STOP_COMMAND_DESCRIPTION),
+        CreateCommand::new(LEAVE_COMMAND_NAME).description(LEAVE_COMMAND_DESCRIPTION),
+    ]
+}
+
+pub fn access_rejection_reply(decision: CommandAccessDecision) -> Option<CommandReply> {
+    match decision {
+        CommandAccessDecision::Allowed => None,
+        CommandAccessDecision::RejectedWrongGuild => Some(CommandReply::ephemeral(
+            "Zebot only accepts commands in its configured Discord server.",
+        )),
+        CommandAccessDecision::RejectedWrongChannel { allowed_channel_id } => {
+            Some(CommandReply::ephemeral(format!(
+                "Please use Zebot commands in <#{allowed_channel_id}>."
+            )))
+        }
+    }
 }
 
 pub fn handle_slash_command<B>(
@@ -146,22 +306,119 @@ pub fn handle_slash_command<B>(
     channel_id: u64,
     command_name: &str,
 ) -> CommandReply {
-    match scope.evaluate_access(guild_id, channel_id) {
-        CommandAccessDecision::RejectedWrongGuild => {
-            CommandReply::ephemeral("Zebot only accepts commands in its configured Discord server.")
+    if let Some(rejection) = access_rejection_reply(scope.evaluate_access(guild_id, channel_id)) {
+        return rejection;
+    }
+
+    match command_name {
+        STATUS_COMMAND_NAME => {
+            let status = app_core.status();
+            CommandReply::public(format_status_message(&status))
         }
-        CommandAccessDecision::RejectedWrongChannel { allowed_channel_id } => {
-            CommandReply::ephemeral(format!(
-                "Please use Zebot commands in <#{allowed_channel_id}>."
-            ))
+        other => CommandReply::ephemeral(format!("Unknown command '/{other}'.")),
+    }
+}
+
+pub async fn execute_play_command<B: VoiceBackend>(
+    scope: CommandScope,
+    app_core: &AppCore<B>,
+    guild_id: Option<u64>,
+    channel_id: u64,
+    url: &str,
+    play_context: PlayCommandContext,
+) -> CommandReply {
+    if let Some(rejection) = access_rejection_reply(scope.evaluate_access(guild_id, channel_id)) {
+        return rejection;
+    }
+
+    let (voice_channel_id, validated_url) = match validate_play_preflight(url, play_context) {
+        Ok(valid) => valid,
+        Err(reply) => return reply,
+    };
+
+    let Some(core_guild_id) = scope.core_guild_id() else {
+        return CommandReply::ephemeral("Zebot guild configuration is invalid.");
+    };
+
+    let request = PlayRequest::new(core_guild_id, voice_channel_id, validated_url.as_str());
+    format_play_outcome(app_core.play(request).await, voice_channel_id)
+}
+
+pub async fn execute_stop_command<B: VoiceBackend>(
+    scope: CommandScope,
+    app_core: &AppCore<B>,
+    guild_id: Option<u64>,
+    channel_id: u64,
+) -> CommandReply {
+    if let Some(rejection) = access_rejection_reply(scope.evaluate_access(guild_id, channel_id)) {
+        return rejection;
+    }
+
+    let was_active = app_core.status().playback_state != PlaybackState::Idle;
+    format_stop_outcome(app_core.stop().await, was_active)
+}
+
+pub async fn execute_leave_command<B: VoiceBackend>(
+    scope: CommandScope,
+    app_core: &AppCore<B>,
+    guild_id: Option<u64>,
+    channel_id: u64,
+) -> CommandReply {
+    if let Some(rejection) = access_rejection_reply(scope.evaluate_access(guild_id, channel_id)) {
+        return rejection;
+    }
+
+    let status_before = app_core.status();
+    let was_connected_or_active = status_before.is_connected_to_voice()
+        || status_before.playback_state != PlaybackState::Idle;
+    format_leave_outcome(app_core.leave().await, was_connected_or_active)
+}
+
+pub fn format_play_outcome(
+    result: Result<BotStatus, CoreError>,
+    voice_channel_id: VoiceChannelId,
+) -> CommandReply {
+    match result {
+        Ok(status) => {
+            let channel_mention = status
+                .voice_channel_id()
+                .map_or_else(|| format!("<#{voice_channel_id}>"), |id| format!("<#{id}>"));
+            let track_label = status
+                .active_track
+                .as_ref()
+                .map_or_else(|| "YouTube audio".to_string(), format_track_metadata);
+            CommandReply::public(format!("Now playing {track_label} in {channel_mention}."))
         }
-        CommandAccessDecision::Allowed => match command_name {
-            STATUS_COMMAND_NAME => {
-                let status = app_core.status();
-                CommandReply::public(format_status_message(&status))
-            }
-            other => CommandReply::ephemeral(format!("Unknown command '/{other}'.")),
-        },
+        Err(CoreError::InvalidUrl(error)) => {
+            CommandReply::ephemeral(format!("Invalid YouTube URL: {error}."))
+        }
+        Err(CoreError::Cancelled) => CommandReply::public(
+            "Playback request was superseded by a newer command before playback started.",
+        ),
+        Err(CoreError::Backend(error)) => {
+            CommandReply::public(format!("Failed to start playback: {error}"))
+        }
+    }
+}
+
+pub fn format_stop_outcome(result: Result<BotStatus, CoreError>, was_active: bool) -> CommandReply {
+    match result {
+        Ok(_) if was_active => CommandReply::public("Stopped playback."),
+        Ok(_) => CommandReply::public("Nothing is currently playing."),
+        Err(error) => CommandReply::public(format!("Failed to stop playback: {error}")),
+    }
+}
+
+pub fn format_leave_outcome(
+    result: Result<BotStatus, CoreError>,
+    was_connected_or_active: bool,
+) -> CommandReply {
+    match result {
+        Ok(_) if was_connected_or_active => {
+            CommandReply::public("Stopped playback and left the voice channel.")
+        }
+        Ok(_) => CommandReply::public("Not connected to a voice channel."),
+        Err(error) => CommandReply::public(format!("Failed to leave voice channel: {error}")),
     }
 }
 
@@ -260,10 +517,151 @@ fn update_gateway_state<B>(
     }
 }
 
+fn extract_play_url_option(command: &CommandInteraction) -> Option<String> {
+    command
+        .data
+        .options()
+        .into_iter()
+        .find(|option| option.name == PLAY_URL_OPTION_NAME)
+        .and_then(|option| match option.value {
+            ResolvedValue::String(value) => Some(value.to_string()),
+            _ => None,
+        })
+}
+
+async fn send_immediate_reply(ctx: &Context, command: &CommandInteraction, reply: CommandReply) {
+    let message = CreateInteractionResponseMessage::new()
+        .content(reply.content)
+        .ephemeral(reply.ephemeral);
+    let response = CreateInteractionResponse::Message(message);
+
+    if let Err(error) = command.create_response(&ctx.http, response).await {
+        eprintln!(
+            "error: failed to respond to slash command '/{}': {error}",
+            command.data.name
+        );
+    }
+}
+
+async fn edit_deferred_reply(ctx: &Context, command: &CommandInteraction, reply: CommandReply) {
+    let edit = EditInteractionResponse::new().content(reply.content);
+    if let Err(error) = command.edit_response(&ctx.http, edit).await {
+        eprintln!(
+            "error: failed to send deferred reply for slash command '/{}': {error}",
+            command.data.name
+        );
+    }
+}
+
 struct DiscordHandler<B> {
     scope: CommandScope,
     app_core: Arc<AppCore<B>>,
     shutting_down: Arc<AtomicBool>,
+    known_bots: Arc<Mutex<HashMap<u64, bool>>>,
+}
+
+impl<B> DiscordHandler<B> {
+    fn lock_known_bots(&self) -> MutexGuard<'_, HashMap<u64, bool>> {
+        self.known_bots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn record_bot_flag(&self, user_id: u64, is_bot: bool) {
+        self.lock_known_bots().insert(user_id, is_bot);
+    }
+
+    async fn resolve_play_context(
+        &self,
+        ctx: &Context,
+        command: &CommandInteraction,
+    ) -> PlayCommandContext {
+        let guild_id = self.scope.guild_id();
+        let bot_user_id = ctx.cache.current_user().id;
+
+        let cached_voice_and_perms = ctx.cache.guild(guild_id).map(|guild| {
+            let invoking_channel = guild
+                .voice_states
+                .get(&command.user.id)
+                .and_then(|state| state.channel_id);
+
+            let permissions = invoking_channel.and_then(|channel_id| {
+                let channel = guild.channels.get(&channel_id)?;
+                let bot_member = guild.members.get(&bot_user_id)?;
+                Some(guild.user_permissions_in(channel, bot_member))
+            });
+
+            (invoking_channel, permissions)
+        });
+
+        let Some((invoking_channel, cached_permissions)) = cached_voice_and_perms else {
+            return PlayCommandContext {
+                invoking_voice_channel_id: None,
+                bot_permissions: None,
+            };
+        };
+
+        let Some(channel_id) = invoking_channel else {
+            return PlayCommandContext {
+                invoking_voice_channel_id: None,
+                bot_permissions: None,
+            };
+        };
+
+        if cached_permissions.is_some() {
+            return PlayCommandContext {
+                invoking_voice_channel_id: Some(channel_id.get()),
+                bot_permissions: cached_permissions,
+            };
+        }
+
+        let fetched_permissions = match guild_id.member(&ctx.http, bot_user_id).await {
+            Ok(bot_member) => ctx.cache.guild(guild_id).and_then(|guild| {
+                let channel = guild.channels.get(&channel_id)?;
+                Some(guild.user_permissions_in(channel, &bot_member))
+            }),
+            Err(_) => None,
+        };
+
+        PlayCommandContext {
+            invoking_voice_channel_id: Some(channel_id.get()),
+            bot_permissions: fetched_permissions,
+        }
+    }
+
+    fn collect_voice_channel_members(
+        &self,
+        ctx: &Context,
+        guild_id: SerenityGuildId,
+        channel_id: VoiceChannelId,
+    ) -> Option<Vec<VoiceChannelMember>> {
+        let target_channel = SerenityChannelId::new(channel_id.get());
+        let known_bots = self.lock_known_bots();
+
+        ctx.cache.guild(guild_id).map(|guild| {
+            guild
+                .voice_states
+                .values()
+                .filter(|state| state.channel_id == Some(target_channel))
+                .map(|state| {
+                    let user_id = state.user_id.get();
+                    let is_bot = state
+                        .member
+                        .as_ref()
+                        .map(|member| member.user.bot)
+                        .or_else(|| {
+                            guild
+                                .members
+                                .get(&state.user_id)
+                                .map(|member| member.user.bot)
+                        })
+                        .or_else(|| known_bots.get(&user_id).copied())
+                        .unwrap_or(false);
+                    VoiceChannelMember { user_id, is_bot }
+                })
+                .collect()
+        })
+    }
 }
 
 #[async_trait]
@@ -272,6 +670,8 @@ impl<B: VoiceBackend + 'static> EventHandler for DiscordHandler<B> {
         if self.shutting_down.load(Ordering::SeqCst) {
             return;
         }
+
+        self.record_bot_flag(ready.user.id.get(), true);
 
         let guild_id = self.scope.guild_id();
         match guild_id
@@ -306,6 +706,98 @@ impl<B: VoiceBackend + 'static> EventHandler for DiscordHandler<B> {
         );
     }
 
+    async fn guild_create(&self, _ctx: Context, guild: Guild, _is_new: Option<bool>) {
+        if guild.id != self.scope.guild_id() {
+            return;
+        }
+
+        let mut known_bots = self.lock_known_bots();
+        for (user_id, member) in &guild.members {
+            known_bots.insert(user_id.get(), member.user.bot);
+        }
+        for (user_id, state) in &guild.voice_states {
+            if let Some(member) = state.member.as_ref() {
+                known_bots.insert(user_id.get(), member.user.bot);
+            }
+        }
+    }
+
+    async fn voice_state_update(&self, ctx: Context, old: Option<VoiceState>, new: VoiceState) {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+
+        if let Some(member) = new.member.as_ref() {
+            self.record_bot_flag(new.user_id.get(), member.user.bot);
+        }
+
+        if new.guild_id != Some(self.scope.guild_id()) {
+            return;
+        }
+
+        let Some(core_guild_id) = self.scope.core_guild_id() else {
+            return;
+        };
+
+        let bot_user_id = ctx.cache.current_user().id;
+        if new.user_id == bot_user_id {
+            match new.channel_id {
+                Some(moved_channel) => {
+                    if let Some(core_channel) = VoiceChannelId::new(moved_channel.get()) {
+                        self.app_core.notify_voice_channel_moved(VoiceTarget::new(
+                            core_guild_id,
+                            core_channel,
+                        ));
+                    }
+                }
+                None => {
+                    let old_channel_id = old
+                        .and_then(|state| state.channel_id)
+                        .map(SerenityChannelId::get);
+                    let current_channel_id = self
+                        .app_core
+                        .status()
+                        .voice_channel_id()
+                        .map(VoiceChannelId::get);
+                    if old_channel_id.is_some()
+                        && old_channel_id == current_channel_id
+                        && let Err(error) = self.app_core.leave().await
+                    {
+                        eprintln!(
+                            "warning: failed to clean up voice state after disconnect: {error}"
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+
+        let status = self.app_core.status();
+        let Some(target) = status.voice_target else {
+            return;
+        };
+
+        if target.guild_id != core_guild_id {
+            return;
+        }
+
+        let Some(members) =
+            self.collect_voice_channel_members(&ctx, self.scope.guild_id(), target.channel_id)
+        else {
+            return;
+        };
+
+        if should_auto_leave_voice_channel(&status, core_guild_id, &members, bot_user_id.get()) {
+            println!(
+                "Voice channel {} has no non-bot members remaining; leaving automatically",
+                target.channel_id
+            );
+            if let Err(error) = self.app_core.leave().await {
+                eprintln!("warning: failed to auto-leave empty voice channel: {error}");
+            }
+        }
+    }
+
     async fn resume(&self, _ctx: Context, _resume: ResumedEvent) {
         update_gateway_state(
             &self.app_core,
@@ -327,24 +819,130 @@ impl<B: VoiceBackend + 'static> EventHandler for DiscordHandler<B> {
             return;
         };
 
-        let reply = handle_slash_command(
-            self.scope,
-            &self.app_core,
-            command.guild_id.map(SerenityGuildId::get),
-            command.channel_id.get(),
-            command.data.name.as_str(),
-        );
+        self.record_bot_flag(command.user.id.get(), command.user.bot);
 
-        let message = CreateInteractionResponseMessage::new()
-            .content(reply.content)
-            .ephemeral(reply.ephemeral);
-        let response = CreateInteractionResponse::Message(message);
+        let guild_id = command.guild_id.map(SerenityGuildId::get);
+        let channel_id = command.channel_id.get();
 
-        if let Err(error) = command.create_response(&ctx.http, response).await {
-            eprintln!(
-                "error: failed to respond to slash command '/{}': {error}",
-                command.data.name
-            );
+        if let Some(rejection) =
+            access_rejection_reply(self.scope.evaluate_access(guild_id, channel_id))
+        {
+            send_immediate_reply(&ctx, &command, rejection).await;
+            return;
+        }
+
+        match command.data.name.as_str() {
+            STATUS_COMMAND_NAME => {
+                let reply = handle_slash_command(
+                    self.scope,
+                    &self.app_core,
+                    guild_id,
+                    channel_id,
+                    STATUS_COMMAND_NAME,
+                );
+                send_immediate_reply(&ctx, &command, reply).await;
+            }
+            PLAY_COMMAND_NAME => {
+                let Some(raw_url) = extract_play_url_option(&command) else {
+                    send_immediate_reply(
+                        &ctx,
+                        &command,
+                        CommandReply::ephemeral("Missing required `url` option for `/play`."),
+                    )
+                    .await;
+                    return;
+                };
+
+                let play_context = self.resolve_play_context(&ctx, &command).await;
+                let (voice_channel_id, validated_url) =
+                    match validate_play_preflight(&raw_url, play_context) {
+                        Ok(valid) => valid,
+                        Err(reply) => {
+                            send_immediate_reply(&ctx, &command, reply).await;
+                            return;
+                        }
+                    };
+
+                if let Err(error) = command.defer(&ctx.http).await {
+                    eprintln!("error: failed to defer '/play' interaction: {error}");
+                    return;
+                }
+
+                let Some(core_guild_id) = self.scope.core_guild_id() else {
+                    edit_deferred_reply(
+                        &ctx,
+                        &command,
+                        CommandReply::public("Zebot guild configuration is invalid."),
+                    )
+                    .await;
+                    return;
+                };
+
+                let request =
+                    PlayRequest::new(core_guild_id, voice_channel_id, validated_url.as_str());
+                let play_result = self.app_core.play(request).await;
+                let reply = match play_result {
+                    Ok(status) => {
+                        let bot_user_id = ctx.cache.current_user().id.get();
+                        let became_empty = status.voice_target.is_some_and(|target| {
+                            self.collect_voice_channel_members(
+                                &ctx,
+                                self.scope.guild_id(),
+                                target.channel_id,
+                            )
+                            .is_some_and(|members| {
+                                should_auto_leave_voice_channel(
+                                    &status,
+                                    core_guild_id,
+                                    &members,
+                                    bot_user_id,
+                                )
+                            })
+                        });
+
+                        if became_empty {
+                            if let Err(error) = self.app_core.leave().await {
+                                eprintln!(
+                                    "warning: failed to leave voice channel that emptied during play: {error}"
+                                );
+                            }
+                            CommandReply::public(format!(
+                                "Everyone left <#{voice_channel_id}> while loading the track, so Zebot disconnected."
+                            ))
+                        } else {
+                            format_play_outcome(Ok(status), voice_channel_id)
+                        }
+                    }
+                    Err(error) => format_play_outcome(Err(error), voice_channel_id),
+                };
+                edit_deferred_reply(&ctx, &command, reply).await;
+            }
+            STOP_COMMAND_NAME => {
+                if let Err(error) = command.defer(&ctx.http).await {
+                    eprintln!("error: failed to defer '/stop' interaction: {error}");
+                    return;
+                }
+                let reply =
+                    execute_stop_command(self.scope, &self.app_core, guild_id, channel_id).await;
+                edit_deferred_reply(&ctx, &command, reply).await;
+            }
+            LEAVE_COMMAND_NAME => {
+                if let Err(error) = command.defer(&ctx.http).await {
+                    eprintln!("error: failed to defer '/leave' interaction: {error}");
+                    return;
+                }
+                let reply =
+                    execute_leave_command(self.scope, &self.app_core, guild_id, channel_id).await;
+                edit_deferred_reply(&ctx, &command, reply).await;
+            }
+            other => {
+                send_immediate_reply(
+                    &ctx,
+                    &command,
+                    CommandReply::ephemeral(format!("Unknown command '/{other}'.")),
+                )
+                .await;
+            }
         }
     }
 }
@@ -352,6 +950,7 @@ impl<B: VoiceBackend + 'static> EventHandler for DiscordHandler<B> {
 pub async fn run_discord_bot<B, S>(
     config: &Config,
     app_core: Arc<AppCore<B>>,
+    songbird: Arc<Songbird>,
     shutdown_signal: S,
 ) -> Result<(), DiscordError>
 where
@@ -364,10 +963,12 @@ where
         scope,
         app_core: Arc::clone(&app_core),
         shutting_down: Arc::clone(&shutting_down),
+        known_bots: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let mut client = Client::builder(&config.discord_token, required_gateway_intents())
         .event_handler(handler)
+        .register_songbird_with(songbird)
         .await
         .map_err(|error| DiscordError::ClientBuild(Box::new(error)))?;
 
@@ -437,12 +1038,18 @@ mod tests {
 
     use serenity::gateway::ConnectionStage;
     use serenity::model::gateway::GatewayIntents;
+    use serenity::model::permissions::Permissions;
+    use songbird::{SerenityInit, Songbird};
     use tokio::sync::Notify;
 
     use super::{
-        CommandAccessDecision, CommandReply, CommandScope, DiscordError, STATUS_COMMAND_NAME,
-        build_slash_commands, format_status_message, handle_slash_command, map_connection_stage,
-        required_gateway_intents, run_with_shutdown, update_gateway_state,
+        CommandAccessDecision, CommandReply, CommandScope, DiscordError, LEAVE_COMMAND_NAME,
+        MissingVoicePermissions, PLAY_COMMAND_NAME, PLAY_URL_OPTION_NAME, PlayCommandContext,
+        STATUS_COMMAND_NAME, STOP_COMMAND_NAME, VoiceChannelMember, build_slash_commands,
+        check_voice_permissions, count_non_bot_members, execute_leave_command,
+        execute_play_command, execute_stop_command, format_status_message, handle_slash_command,
+        map_connection_stage, required_gateway_intents, run_with_shutdown,
+        should_auto_leave_voice_channel, update_gateway_state, validate_play_preflight,
     };
     use crate::core::{
         AppCore, CancellationToken, PlaybackGeneration, UnavailableVoiceBackend, VoiceBackend,
@@ -452,10 +1059,13 @@ mod tests {
         BotStatus, DiscordConnectionState, GuildId, PlayRequest, PlaybackState, TrackMetadata,
         VoiceChannelId, VoiceTarget,
     };
+    use crate::voice::build_songbird_config;
     use crate::youtube::YouTubeUrl;
 
     #[derive(Default)]
     struct RecordingBackend {
+        join_targets: Mutex<Vec<VoiceTarget>>,
+        play_video_ids: Mutex<Vec<String>>,
         leave_calls: AtomicUsize,
         stop_calls: AtomicUsize,
     }
@@ -476,19 +1086,27 @@ mod tests {
 
         async fn join(
             &self,
-            _target: VoiceTarget,
+            target: VoiceTarget,
             _cancel: CancellationToken,
         ) -> Result<(), VoiceBackendError> {
+            self.join_targets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(target);
             Ok(())
         }
 
         async fn play(
             &self,
             _target: VoiceTarget,
-            _track: &TrackMetadata,
+            track: &TrackMetadata,
             _generation: PlaybackGeneration,
             _cancel: CancellationToken,
         ) -> Result<(), VoiceBackendError> {
+            self.play_video_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(track.url.video_id().to_string());
             Ok(())
         }
 
@@ -514,20 +1132,25 @@ mod tests {
     }
 
     #[test]
-    fn registers_status_slash_command() {
+    fn registers_status_play_stop_and_leave_slash_commands() {
         let commands = build_slash_commands();
-        assert_eq!(commands.len(), 1);
+        assert_eq!(commands.len(), 4);
         let debug_repr = format!("{commands:?}");
-        assert!(debug_repr.contains("\"status\""));
-        assert!(debug_repr.contains(super::STATUS_COMMAND_DESCRIPTION));
+        assert!(debug_repr.contains(&format!("\"{STATUS_COMMAND_NAME}\"")));
+        assert!(debug_repr.contains(&format!("\"{PLAY_COMMAND_NAME}\"")));
+        assert!(debug_repr.contains(&format!("\"{PLAY_URL_OPTION_NAME}\"")));
+        assert!(debug_repr.contains(&format!("\"{STOP_COMMAND_NAME}\"")));
+        assert!(debug_repr.contains(&format!("\"{LEAVE_COMMAND_NAME}\"")));
     }
 
     #[tokio::test]
-    async fn client_builder_initializes_with_rustls_and_minimal_features() {
+    async fn client_builder_initializes_with_rustls_and_songbird() {
+        let songbird = Songbird::serenity_from_config(build_songbird_config());
         let client = serenity::client::Client::builder(
             "test-token-not-used-for-network",
             required_gateway_intents(),
         )
+        .register_songbird_with(songbird)
         .await;
         assert!(client.is_ok());
     }
@@ -566,6 +1189,248 @@ mod tests {
             scope.evaluate_access(None, 200),
             CommandAccessDecision::RejectedWrongGuild
         );
+    }
+
+    #[test]
+    fn play_preflight_requires_voice_channel_permissions_and_valid_url() {
+        let not_in_voice = validate_play_preflight(
+            "https://youtu.be/dQw4w9WgXcQ",
+            PlayCommandContext {
+                invoking_voice_channel_id: None,
+                bot_permissions: None,
+            },
+        )
+        .unwrap_err();
+        assert!(not_in_voice.ephemeral);
+        assert!(not_in_voice.content.contains("join a voice channel"));
+
+        let missing_speak = validate_play_preflight(
+            "https://youtu.be/dQw4w9WgXcQ",
+            PlayCommandContext {
+                invoking_voice_channel_id: Some(777),
+                bot_permissions: Some(Permissions::CONNECT),
+            },
+        )
+        .unwrap_err();
+        assert!(missing_speak.ephemeral);
+        assert!(missing_speak.content.contains("Speak"));
+        assert!(missing_speak.content.contains("<#777>"));
+
+        let missing_both = validate_play_preflight(
+            "https://youtu.be/dQw4w9WgXcQ",
+            PlayCommandContext {
+                invoking_voice_channel_id: Some(777),
+                bot_permissions: Some(Permissions::VIEW_CHANNEL),
+            },
+        )
+        .unwrap_err();
+        assert!(missing_both.ephemeral);
+        assert!(missing_both.content.contains("Connect and Speak"));
+
+        let invalid_url = validate_play_preflight(
+            "file:///etc/passwd",
+            PlayCommandContext {
+                invoking_voice_channel_id: Some(777),
+                bot_permissions: Some(Permissions::CONNECT | Permissions::SPEAK),
+            },
+        )
+        .unwrap_err();
+        assert!(invalid_url.ephemeral);
+        assert!(invalid_url.content.contains("Invalid YouTube URL"));
+
+        let (channel_id, url) = validate_play_preflight(
+            "https://youtu.be/dQw4w9WgXcQ",
+            PlayCommandContext {
+                invoking_voice_channel_id: Some(777),
+                bot_permissions: Some(Permissions::CONNECT | Permissions::SPEAK),
+            },
+        )
+        .unwrap();
+        assert_eq!(channel_id.get(), 777);
+        assert_eq!(url.video_id(), "dQw4w9WgXcQ");
+    }
+
+    #[test]
+    fn voice_permission_checker_identifies_missing_connect_and_speak() {
+        assert_eq!(
+            check_voice_permissions(Permissions::CONNECT | Permissions::SPEAK),
+            Ok(())
+        );
+        assert_eq!(
+            check_voice_permissions(Permissions::SPEAK),
+            Err(MissingVoicePermissions {
+                connect: true,
+                speak: false,
+            })
+        );
+        assert_eq!(
+            check_voice_permissions(Permissions::CONNECT),
+            Err(MissingVoicePermissions {
+                connect: false,
+                speak: true,
+            })
+        );
+        assert_eq!(
+            check_voice_permissions(Permissions::empty()),
+            Err(MissingVoicePermissions {
+                connect: true,
+                speak: true,
+            })
+        );
+    }
+
+    #[test]
+    fn empty_voice_channel_detection_ignores_bots_and_only_triggers_when_connected() {
+        let guild_id = GuildId::new(100).unwrap();
+        let channel_id = VoiceChannelId::new(300).unwrap();
+        let connected = BotStatus {
+            discord_state: DiscordConnectionState::Connected,
+            voice_target: Some(VoiceTarget::new(guild_id, channel_id)),
+            playback_state: PlaybackState::Playing,
+            active_track: None,
+        };
+
+        let only_bot = vec![VoiceChannelMember {
+            user_id: 1,
+            is_bot: true,
+        }];
+        let with_other_bot = vec![
+            VoiceChannelMember {
+                user_id: 1,
+                is_bot: true,
+            },
+            VoiceChannelMember {
+                user_id: 2,
+                is_bot: true,
+            },
+        ];
+        let with_human = vec![
+            VoiceChannelMember {
+                user_id: 1,
+                is_bot: true,
+            },
+            VoiceChannelMember {
+                user_id: 42,
+                is_bot: false,
+            },
+        ];
+
+        assert_eq!(count_non_bot_members(&only_bot, 1), 0);
+        assert_eq!(count_non_bot_members(&with_other_bot, 1), 0);
+        assert_eq!(count_non_bot_members(&with_human, 1), 1);
+
+        assert!(should_auto_leave_voice_channel(
+            &connected, guild_id, &only_bot, 1
+        ));
+        assert!(should_auto_leave_voice_channel(
+            &connected,
+            guild_id,
+            &with_other_bot,
+            1
+        ));
+        assert!(!should_auto_leave_voice_channel(
+            &connected,
+            guild_id,
+            &with_human,
+            1
+        ));
+        assert!(!should_auto_leave_voice_channel(
+            &connected,
+            GuildId::new(999).unwrap(),
+            &only_bot,
+            1
+        ));
+        assert!(!should_auto_leave_voice_channel(
+            &BotStatus::default(),
+            guild_id,
+            &only_bot,
+            1
+        ));
+    }
+
+    #[tokio::test]
+    async fn play_stop_and_leave_commands_delegate_to_app_core_and_move_channels() {
+        let scope = CommandScope::new(100, 200).unwrap();
+        let backend = Arc::new(RecordingBackend::default());
+        let core = AppCore::new(Arc::clone(&backend));
+        let perms = Some(Permissions::CONNECT | Permissions::SPEAK);
+
+        let first_reply = execute_play_command(
+            scope,
+            &core,
+            Some(100),
+            200,
+            "https://youtu.be/firstTrack01",
+            PlayCommandContext {
+                invoking_voice_channel_id: Some(501),
+                bot_permissions: perms,
+            },
+        )
+        .await;
+        assert!(!first_reply.ephemeral);
+        assert!(first_reply.content.contains("Sample Song"));
+        assert!(first_reply.content.contains("<#501>"));
+        assert_eq!(
+            core.status().voice_channel_id().map(VoiceChannelId::get),
+            Some(501)
+        );
+        assert_eq!(core.status().playback_state, PlaybackState::Playing);
+
+        let moved_reply = execute_play_command(
+            scope,
+            &core,
+            Some(100),
+            200,
+            "https://youtu.be/secondTrack2",
+            PlayCommandContext {
+                invoking_voice_channel_id: Some(502),
+                bot_permissions: perms,
+            },
+        )
+        .await;
+        assert!(!moved_reply.ephemeral);
+        assert!(moved_reply.content.contains("<#502>"));
+        assert_eq!(
+            core.status().voice_channel_id().map(VoiceChannelId::get),
+            Some(502)
+        );
+
+        let stop_reply = execute_stop_command(scope, &core, Some(100), 200).await;
+        assert_eq!(stop_reply, CommandReply::public("Stopped playback."));
+        assert_eq!(core.status().playback_state, PlaybackState::Idle);
+        assert_eq!(
+            core.status().voice_channel_id().map(VoiceChannelId::get),
+            Some(502)
+        );
+
+        let stop_again = execute_stop_command(scope, &core, Some(100), 200).await;
+        assert_eq!(
+            stop_again,
+            CommandReply::public("Nothing is currently playing.")
+        );
+
+        let leave_reply = execute_leave_command(scope, &core, Some(100), 200).await;
+        assert_eq!(
+            leave_reply,
+            CommandReply::public("Stopped playback and left the voice channel.")
+        );
+        assert_eq!(core.status().voice_target, None);
+
+        let leave_again = execute_leave_command(scope, &core, Some(100), 200).await;
+        assert_eq!(
+            leave_again,
+            CommandReply::public("Not connected to a voice channel.")
+        );
+
+        let joined: Vec<u64> = backend
+            .join_targets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|target| target.channel_id.get())
+            .collect();
+        assert_eq!(joined, vec![501, 502]);
+        assert_eq!(backend.leave_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

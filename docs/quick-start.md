@@ -8,7 +8,7 @@ Install the following tools before building or running Zebot:
 
 - **Rust toolchain (`rustup`):** Install from [rustup.rs](https://rustup.rs/) with the `rustfmt` and `clippy` components.
 - **Git:** Required for version control and repository workflows.
-- **C/C++ Build Tools + `cmake` (Windows):** Required for compiling native Discord voice/Opus dependencies (`songbird` / `audiopus`).
+- **C/C++ Build Tools + `cmake` (Windows):** Required for compiling native Discord voice/Opus dependencies (`songbird` / `opus2`).
   - Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the **Desktop development with C++** workload (MSVC compiler + Windows SDK).
   - Install `cmake` (for example via `winget install Kitware.CMake`) and ensure it is on `PATH`.
   - On Linux/macOS, install your platform C/C++ toolchain (`build-essential` / Xcode Command Line Tools) and `cmake`.
@@ -93,7 +93,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-To start Zebot locally (runs `.env` and external tool preflight checks, connects to Discord, registers `/status` in `DISCORD_GUILD_ID`, and shuts down cleanly on `Ctrl+C`):
+To start Zebot locally (runs `.env` and external tool preflight checks, connects to Discord, registers `/status`, `/play`, `/stop`, and `/leave` in `DISCORD_GUILD_ID`, and shuts down cleanly on `Ctrl+C`):
 
 ```powershell
 cargo run

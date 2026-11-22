@@ -4,4 +4,5 @@ pub mod core;
 pub mod dependencies;
 pub mod discord;
 pub mod state;
+pub mod voice;
 pub mod youtube;
